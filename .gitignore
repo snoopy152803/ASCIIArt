@@ -1,0 +1,30 @@
+# Build output
+asciiapp.exe
+*.o
+*.obj
+.buildtmp/
+
+# Generated assets, rebuilt by `make icon` / on first run
+asciiapp.ico
+glyphbank.npz
+ramp_cache.json
+
+# Test renders
+verify_out/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.lock
+~*
+Thumbs.db
+desktop.ini
+
+# Large media kept locally but not in the repo.
+# samples/iwctest.mp4 is 1.36 GB; GitHub refuses anything over 100 MB, and it
+# was the real reason commits were slow. The file stays on disk, just untracked.
+samples/iwctest.mp4
+*.mkv
+*.mov

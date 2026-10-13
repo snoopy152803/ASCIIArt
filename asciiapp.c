@@ -47,9 +47,17 @@
 
 #define MODE_ASCII 0
 #define MODE_LINES 1
-#define MODE_BRAILLE 2
-#define MODE_BLOCK 3
-#define MODE_COUNT 4
+#define MODE_BLUR 2
+#define MODE_BRAILLE 3
+#define MODE_BLOCK 4
+#define MODE_COUNT 5
+
+/* Blur strength, as a fraction of the decoded frame's height. 1.0 is the
+   game's opening state: unrecognisable. */
+#define BLUR_DEFAULT 0.35f
+#define BLUR_MAX_FRAC 0.10          /* radius at amount 1.0 */
+#define BLUR_GAME_STEP 0.72f        /* Space multiplies the blur by this */
+#define BLUR_GAME_FLOOR 0.004f      /* below this the picture is simply clear */
 
 /* Braille: 2x4 dots per cell, so 256 patterns. The terminal viewer's `half`
    and `quad` modes are not offered here - those exist only to work around a
@@ -115,6 +123,10 @@ typedef struct {
 
     /* source frame from ffmpeg */
     unsigned char *frame;    /* RGB24, dec_w x dec_h */
+    unsigned char *frameb;   /* the same, blurred, for blur mode */
+    unsigned char *blurtmp;  /* scratch between the separable passes */
+    int blur_w, blur_h;      /* size the blur buffers were made for */
+    int blurred_r;           /* radius currently sitting in frameb */
     int dec_w, dec_h, frame_w, frame_h;
     int have_frame;
 
@@ -138,6 +150,8 @@ typedef struct {
     int slideshow;
     double av_offset;                   /* audio lead, seconds */
     float line_thresh;                  /* line art: ink this much edge */
+    float blur;                         /* blur mode: 0..1 */
+    float game_blur;                    /* the game's current blur */
     double seek_to;                     /* pending debounced seek */
     int seek_pending;
     wchar_t probed[MAX_PATH];           /* ffprobe cache key */
@@ -209,7 +223,7 @@ static void die(const wchar_t *msg)
     ExitProcess(1);
 }
 
-static void auto_levels_frame(void);
+static void auto_levels_buf(unsigned char *buf);
 static int pump_video(void);
 static int open_media(const wchar_t *path, double start_at);
 static void adopt_child(HANDLE proc);
@@ -246,6 +260,86 @@ static void blur_band(void *vctx, int y0, int y1)
             g.lumb[(size_t)y * w + x] = (hsum + vsum) / 32.0f;
         }
     }
+}
+
+/* Separable box blur over the decoded frame.
+ *
+ * Running sums make each pass cost the same whatever the radius, which
+ * matters because the game opens at a radius of tens of pixels. Two
+ * iterations are used rather than one: a single box leaves obvious square
+ * halos around bright points, while two approximate a smooth falloff. The
+ * frame itself is never touched - video needs it intact for the next
+ * resample - so the result lands in a second buffer. */
+typedef struct { int r; const unsigned char *src; } BlurJob;
+
+static void blur_h_band(void *vctx, int y0, int y1)
+{
+    const BlurJob *j = (const BlurJob *)vctx;
+    int w = g.dec_w, r = j->r, win = 2 * r + 1;
+    for (int y = y0; y < y1; y++) {
+        const unsigned char *src = j->src + (size_t)y * w * 3;
+        unsigned char *dst = g.blurtmp + (size_t)y * w * 3;
+        for (int c = 0; c < 3; c++) {
+            int sum = 0;
+            for (int i = -r; i <= r; i++) sum += src[clampi(i, 0, w - 1) * 3 + c];
+            for (int x = 0; x < w; x++) {
+                dst[x * 3 + c] = (unsigned char)(sum / win);
+                sum += src[clampi(x + r + 1, 0, w - 1) * 3 + c]
+                     - src[clampi(x - r, 0, w - 1) * 3 + c];
+            }
+        }
+    }
+}
+
+/* The vertical pass walks columns, so the band range here is in x. */
+static void blur_v_band(void *vctx, int x0, int x1)
+{
+    const BlurJob *j = (const BlurJob *)vctx;
+    int w = g.dec_w, h = g.dec_h, r = j->r, win = 2 * r + 1;
+    for (int x = x0; x < x1; x++) {
+        for (int c = 0; c < 3; c++) {
+            int sum = 0;
+            for (int i = -r; i <= r; i++)
+                sum += g.blurtmp[((size_t)clampi(i, 0, h - 1) * w + x) * 3 + c];
+            for (int y = 0; y < h; y++) {
+                g.frameb[((size_t)y * w + x) * 3 + c] = (unsigned char)(sum / win);
+                sum += g.blurtmp[((size_t)clampi(y + r + 1, 0, h - 1) * w + x) * 3 + c]
+                     - g.blurtmp[((size_t)clampi(y - r, 0, h - 1) * w + x) * 3 + c];
+            }
+        }
+    }
+}
+
+/* Fill g.frameb with the frame blurred by `radius`. Returns 0 if it could
+   not be done, in which case callers fall back to the sharp frame. */
+static int blur_frame(int radius)
+{
+    int w = g.dec_w, h = g.dec_h;
+    if (radius < 1 || w < 2 || h < 2) return 0;
+    if (radius > w / 2 - 1) radius = w / 2 - 1;
+    if (radius > h / 2 - 1) radius = h / 2 - 1;
+    if (radius < 1) return 0;
+
+    if (!g.frameb || !g.blurtmp || g.blur_w != w || g.blur_h != h) {
+        free(g.frameb);
+        free(g.blurtmp);
+        size_t n = (size_t)w * h * 3;
+        g.frameb = (unsigned char *)malloc(n);
+        g.blurtmp = (unsigned char *)malloc(n);
+        g.blur_w = w;
+        g.blur_h = h;
+        g.blurred_r = -1;
+        if (!g.frameb || !g.blurtmp) return 0;
+    }
+
+    BlurJob j = { radius, g.frame };
+    for (int pass = 0; pass < 2; pass++) {
+        parallel_rows(blur_h_band, &j, 0, h);
+        parallel_rows(blur_v_band, &j, 0, w);
+        j.src = g.frameb;                      /* second pass refines the first */
+    }
+    g.blurred_r = radius;
+    return 1;
 }
 
 static void clear_band(void *ctx, int y0, int y1);
@@ -553,7 +647,7 @@ static int open_media_ex(const wchar_t *path, double start_at, int wait_first)
         }
         g.have_frame = 1;
     }
-    if (!g.is_video && g.levels) auto_levels_frame();
+    if (!g.is_video && g.levels) auto_levels_buf(g.frame);
 
     if (g.is_video) {
         g.playing = 1;
@@ -810,11 +904,17 @@ static void build_braille_atlas(int cw, int ch)
    optionally, the mean colour of each cell. */
 typedef struct { int sub_w, sub_h, cols, rows; } ResampleCtx;
 
+/* The sharp frame, or the blurred copy when blur mode has prepared one. */
+static const unsigned char *active_frame(void)
+{
+    return (g.blurred_r > 0 && g.frameb) ? g.frameb : g.frame;
+}
+
 static void resample_lum_band(void *vctx, int yy0, int yy1)
 {
     const ResampleCtx *c = (const ResampleCtx *)vctx;
     int sub_w = c->sub_w, sub_h = c->sub_h;
-    const unsigned char *src = g.frame;
+    const unsigned char *src = active_frame();
     int sw = g.dec_w, sh = g.dec_h;
 
     for (int y = yy0; y < yy1; y++) {
@@ -843,7 +943,7 @@ static void resample_rgb_band(void *vctx, int yy0, int yy1)
 {
     const ResampleCtx *c = (const ResampleCtx *)vctx;
     int cols = c->cols, rows = c->rows;
-    const unsigned char *src = g.frame;
+    const unsigned char *src = active_frame();
     int sw = g.dec_w, sh = g.dec_h;
 
     for (int y = yy0; y < yy1; y++) {
@@ -890,13 +990,13 @@ static void resample(int sub_w, int sub_h, int cols, int rows)
    Photographs and renders rarely span 0..1, and without this the glyph set
    only ever uses its middle, which flattens the result. Applied to stills
    only: re-levelling every frame of a video makes the picture pulse. */
-static void auto_levels_frame(void)
+static void auto_levels_buf(unsigned char *buf)
 {
     size_t n = (size_t)g.dec_w * g.dec_h;
     unsigned int hist[256];
     memset(hist, 0, sizeof hist);
     for (size_t i = 0; i < n; i++) {
-        const unsigned char *p = g.frame + i * 3;
+        const unsigned char *p = buf + i * 3;
         hist[(54u * p[0] + 183u * p[1] + 19u * p[2]) >> 8]++;
     }
     size_t lowcut = n / 100, highcut = n - n / 100, run = 0;
@@ -913,7 +1013,7 @@ static void auto_levels_frame(void)
         gain[v] = v > 0 ? stretched / v : 0.0f;
     }
     for (size_t i = 0; i < n; i++) {
-        unsigned char *p = g.frame + i * 3;
+        unsigned char *p = buf + i * 3;
         int l = (int)((54u * p[0] + 183u * p[1] + 19u * p[2]) >> 8);
         float s = gain[l];
         for (int c = 0; c < 3; c++)
@@ -1332,7 +1432,12 @@ static void render(void)
     if (!g.have_frame || !g.pixels) return;
 
     int ch, cw;
-    if (g.game) {
+    if (g.game && g.mode == MODE_BLUR) {
+        /* The blur game keeps full resolution and takes the focus away
+           instead, so the grid is the ordinary one. */
+        ch = g.cell_h;
+        cw = imax(1, ch / 2);
+    } else if (g.game) {
         /* Game mode counts columns instead of pixels, so "one letter" is a
            reachable state no matter how big the window is. */
         cw = imax(1, g.dib_w / imax(1, g.game_cols));
@@ -1378,6 +1483,22 @@ static void render(void)
         g.scratch_cells = (int)need_cells;
     }
     if (!g.lum || !g.lumb || !g.cellrgb) return;
+
+    /* Blur mode works on a blurred copy of the frame, so every later stage -
+       glyph matching, cell colour, everything - simply sees a softer picture
+       and needs no special case. */
+    g.blurred_r = 0;
+    if (g.mode == MODE_BLUR) {
+        float amount = g.game ? g.game_blur : g.blur;
+        int radius = (int)(amount * BLUR_MAX_FRAC * g.dec_h + 0.5);
+        if (radius > 0 && blur_frame(radius) && g.levels) {
+            /* Blurring pulls everything towards the average, and since glyph
+               density tracks brightness that turns the picture into a flat
+               wall of dense characters. Re-stretching the range afterwards
+               keeps it reading as a defocused photograph instead. */
+            auto_levels_buf(g.frameb);
+        }
+    }
 
     resample(sub_w, sub_h, cols, rows);
     build_atlas(cw, ch);
@@ -1528,6 +1649,7 @@ static const wchar_t *mode_name(void)
     if (g.mode == MODE_BLOCK) return L"blocks";
     if (g.mode == MODE_BRAILLE) return L"braille";
     if (g.mode == MODE_LINES) return L"line art";
+    if (g.mode == MODE_BLUR) return L"blur";
     return g.cell_h >= SHAPE_MIN_CELL ? L"ascii (shape)" : L"ascii (tone)";
 }
 
@@ -1648,6 +1770,21 @@ static void change_picture(int delta)
 }
 
 /* A random different one, for the guessing game. */
+/* One step of the game's reveal. Resolution modes add cells; blur mode
+   keeps every cell and takes the blur off instead. */
+static void game_reveal_step(void)
+{
+    if (g.mode == MODE_BLUR) {
+        g.game_blur *= BLUR_GAME_STEP;
+        if (g.game_blur < BLUR_GAME_FLOOR) g.game_blur = 0.0f;
+        return;
+    }
+    int next = g.game_cols + 1;
+    int grown = (int)(g.game_cols * 1.45f);
+    g.game_cols = grown > next ? grown : next;
+    if (g.game_cols > 600) g.game_cols = 600;
+}
+
 static void next_picture(void)
 {
     static wchar_t found[MAX_SIBLINGS][MAX_PATH];
@@ -1677,12 +1814,25 @@ static void pretty_name(wchar_t *out, int cap)
 
 /* 1..100, where 100 is maximum zoom (a few giant letters) and 1 is the full
    grid. Logarithmic, because the column count is geometric. */
+/* How far along the game is: 100 is the opening state, 1 is fully revealed.
+   Logarithmic in both reveal styles, since both progress geometrically. */
+static int game_level(void);
+
 static int zoom_level(void)
 {
     double maxcols = g.dib_w > 2 ? g.dib_w : 2;        /* cw can go down to 1 */
     double c = g.cols < 1 ? 1 : g.cols;
     if (c > maxcols) c = maxcols;
     double lvl = 100.0 - 99.0 * (log(c) / log(maxcols));
+    return clampi((int)(lvl + 0.5), 1, 100);
+}
+
+static int game_level(void)
+{
+    if (g.mode != MODE_BLUR) return zoom_level();
+    if (g.game_blur <= BLUR_GAME_FLOOR) return 1;
+    double span = log(1.0 / BLUR_GAME_FLOOR);
+    double lvl = 100.0 * log(g.game_blur / BLUR_GAME_FLOOR) / span;
     return clampi((int)(lvl + 0.5), 1, 100);
 }
 
@@ -1704,12 +1854,12 @@ static void update_title(void)
             wchar_t nice[128];
             pretty_name(nice, 128);
             _snwprintf(g.status, 255, L"ASCIIArt - it was: %s - level %d",
-                       nice, zoom_level());
+                       nice, game_level());
         } else {
             _snwprintf(g.status, 255,
                        L"Guess the picture - level %d - Space reveals more, "
                        L"N next, R restart, Enter gives up",
-                       zoom_level());
+                       game_level());
         }
     } else {
         wchar_t extra[128] = L"";
@@ -1852,8 +2002,10 @@ static void draw_help(HDC dc)
     const wchar_t **lines;
     static const wchar_t *normal_lines[] = {
         L"  + / -  or wheel    zoom  (4-48 px cells)",
-        L"  M                  mode: ascii / line art / braille / blocks",
-        L"  [  ]               midtones  (line art: edge threshold)",
+        L"  M                  mode: ascii / line art / blur /",
+        L"                     braille / blocks",
+        L"  [  ]               midtones  (line art: edge threshold,",
+        L"                     blur mode: how much blur)",
         L"  left / right       previous / next picture in the folder",
         L"  C                  colour / monochrome",
         L"  I                  invert",
@@ -1877,6 +2029,7 @@ static void draw_help(HDC dc)
     lines = normal_lines;
     static const wchar_t *game_lines[] = {
         L"  Space             reveal a bit more",
+        L"                    (blur mode: take the blur off instead)",
         L"  N                 another picture",
         L"  R                 start this one over",
         L"  Enter             give up, show what it was",
@@ -1946,7 +2099,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == 2) {                       /* slideshow tick */
             if (g.slideshow && !g.is_video) {
                 change_picture(1);
-                if (g.game) { g.game_cols = 1; g.game_reveal = 0; }
+                if (g.game) { g.game_cols = 1; g.game_blur = 1.0f; g.game_reveal = 0; }
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
@@ -1963,10 +2116,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (frac > 1) frac = 1;
             open_media(g.path, frac * g.duration);
         } else if (g.game) {
-            int next = g.game_cols + 1;
-            int grown = (int)(g.game_cols * 1.45f);
-            g.game_cols = grown > next ? grown : next;
-            if (g.game_cols > 600) g.game_cols = 600;
+            game_reveal_step();
         }
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
@@ -1980,7 +2130,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_KEYDOWN:
         if (wp == VK_LEFT || wp == VK_RIGHT) {
             change_picture(wp == VK_RIGHT ? 1 : -1);
-            if (g.game) { g.game_cols = 1; g.game_reveal = 0; }
+            if (g.game) { g.game_cols = 1; g.game_blur = 1.0f; g.game_reveal = 0; }
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
@@ -1993,7 +2143,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 'c': case 'C': g.mono = !g.mono; break;
         case 'i': case 'I': g.invert = !g.invert; break;
         case '[':
-            if (g.mode == MODE_LINES) {
+            if (g.mode == MODE_BLUR) {
+                float *b = g.game ? &g.game_blur : &g.blur;
+                *b = clampf(*b * 0.75f, 0.0f, 1.0f);
+                if (*b < BLUR_GAME_FLOOR) *b = 0.0f;
+            } else if (g.mode == MODE_LINES) {
                 g.line_thresh = clampf(g.line_thresh * 0.8f, 0.005f, 1.0f);
             } else {
                 g.out_gamma = clampf(g.out_gamma + 0.06f, 0.2f, 2.0f);
@@ -2001,7 +2155,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case ']':
-            if (g.mode == MODE_LINES) {
+            if (g.mode == MODE_BLUR) {
+                float *b = g.game ? &g.game_blur : &g.blur;
+                *b = clampf(*b < BLUR_GAME_FLOOR ? BLUR_GAME_FLOOR : *b * 1.333f,
+                            0.0f, 1.0f);
+            } else if (g.mode == MODE_LINES) {
                 g.line_thresh = clampf(g.line_thresh * 1.25f, 0.005f, 1.0f);
             } else {
                 g.out_gamma = clampf(g.out_gamma - 0.06f, 0.2f, 2.0f);
@@ -2048,6 +2206,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case 'g': case 'G':
             g.game = !g.game;
             g.game_cols = 1;
+            g.game_blur = 1.0f;
             g.game_reveal = 0;
             g.show_help = 0;
             /* Play with whatever is on screen; if that is nothing, go and
@@ -2066,6 +2225,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.audio_on = 1;
             g.av_offset = AV_OFFSET_DEFAULT;
             g.line_thresh = LINE_THRESH_DEFAULT;
+            g.blur = BLUR_DEFAULT;
+            g.game_blur = 1.0f;
             build_tone_tables();
             if (was_game && g.path[0]) open_media(g.path, 0);
             break;
@@ -2081,7 +2242,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             else KillTimer(hwnd, 2);
             break;
         case 'r': case 'R':
-            if (g.game) { g.game_cols = 1; g.game_reveal = 0; }
+            if (g.game) { g.game_cols = 1; g.game_blur = 1.0f; g.game_reveal = 0; }
             break;
         case 13:                      /* Enter: give up, show what it was */
             if (g.game) g.game_reveal = 1;
@@ -2095,11 +2256,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             save_bmp(); return 0;
         case ' ':
             if (g.game) {
-                /* reveal a little more of the picture */
-                int next = g.game_cols + 1;
-                int grown = (int)(g.game_cols * 1.45f);
-                g.game_cols = grown > next ? grown : next;
-                if (g.game_cols > 600) g.game_cols = 600;
+                game_reveal_step();           /* reveal a little more */
             } else if (g.is_video) {
                 g.playing = !g.playing;
                 if (!g.playing) stop_audio();
@@ -2205,6 +2362,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     g.have_ffplay = 1;   /* assumed; a missing ffplay just never starts */
     g.av_offset = AV_OFFSET_DEFAULT;
     g.line_thresh = LINE_THRESH_DEFAULT;
+    g.blur = BLUR_DEFAULT;
+    g.game_blur = 1.0f;
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof wc);
@@ -2246,6 +2405,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!wcscmp(argv[i], L"-splash")) { }   /* read below */
         else if (!wcscmp(argv[i], L"-L")) g.levels = 0;
         else if (!wcscmp(argv[i], L"-av") && i + 1 < argc) g.av_offset = _wtof(argv[++i]);
+        else if (!wcscmp(argv[i], L"-blur") && i + 1 < argc) g.blur = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-lt") && i + 1 < argc) g.line_thresh = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-mono")) g.mono = 1;
         else if (!wcscmp(argv[i], L"-inv")) g.invert = 1;
@@ -2253,7 +2413,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
             const wchar_t *m = argv[++i];
             g.mode = !wcscmp(m, L"block") ? MODE_BLOCK
                    : !wcscmp(m, L"braille") ? MODE_BRAILLE
-                   : !wcscmp(m, L"lines") ? MODE_LINES : MODE_ASCII;
+                   : !wcscmp(m, L"lines") ? MODE_LINES
+                   : !wcscmp(m, L"blur") ? MODE_BLUR : MODE_ASCII;
         }
         else if (argv[i][0] != L'-') infile = argv[i];
     }

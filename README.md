@@ -24,10 +24,10 @@ Press **H** in the app for the key list. In short:
 | key | |
 |---|---|
 | `+` `-` or wheel | zoom, 2–600 px cells |
-| `M` | mode: ascii / line art / braille / blocks |
+| `M` | mode: ascii / line art / blur / braille / blocks |
 | `←` `→` | previous / next picture in the folder |
 | `C` / `I` | colour or mono / invert |
-| `[` `]` | brighter / darker midtones (line art: edge threshold) |
+| `[` `]` | brighter / darker midtones (line art: edge threshold; blur: amount) |
 | `A` | mute / unmute video sound |
 | `;` `'` | nudge the audio earlier / later |
 | `L` | auto-levels on/off |
@@ -93,14 +93,21 @@ is open. `N` jumps to another at random, `R` restarts, `Enter` gives up and
 names it — the title bar hides the filename until then, since it would
 otherwise be the answer.
 
-Zoom is reported as a **level** from 1 to 100, where 100 is maximum zoom (a
-single letter) and 1 is the full grid. It is logarithmic, because the column
-count is geometric.
+Zoom is reported as a **level** from 1 to 100, where 100 is the opening state
+and 1 is fully revealed. It is logarithmic, because both reveals progress
+geometrically.
+
+**Two ways to reveal**, picked by the current mode. In the normal modes the
+picture starts as one giant character and `Space` adds cells. In **blur mode**
+it keeps full resolution and starts out of focus instead, with `Space` taking
+the blur off — about 17 presses from unrecognisable to sharp. `M` switches
+between them mid-game.
 
 **Modes.** `ascii` matches glyph shapes to the image; `line art` draws only
-edges, using the character that matches each edge's direction; `braille` uses
-2×4 dithered dots (drawn, not from a font — Consolas has no braille);
-`blocks` fills each cell with a solid colour. The terminal's `half` and `quad` modes
+edges, using the character that matches each edge's direction; `blur` renders
+a defocused copy of the picture; `braille` uses 2×4 dithered dots (drawn, not
+from a font — Consolas has no braille); `blocks` fills each cell with a solid
+colour. The terminal's `half` and `quad` modes
 are deliberately *not* here: those exist only to work around a terminal cell
 having one foreground and one background colour, which this app isn't subject
 to — `blocks` is the equivalent and is strictly better.
@@ -306,6 +313,22 @@ During playback: **q** or **Esc** quits, **space** pauses.
 
 `--help` lists everything, including `--edge`, `--whiten`, `--match`,
 `--gamma`, `--contrast`, `--fps`, `--chars` and `--colors {truecolor,256,16,none}`.
+
+## Blur
+
+![blur game](docs/blur-game.png)
+
+A separable box blur over the decoded frame, with running sums so each pass
+costs the same whatever the radius — the game opens at a radius of tens of
+pixels and that is no slower than a gentle one (measured: ~2 ms either way).
+Two iterations rather than one, because a single box leaves square halos
+around bright points while two approximate a smooth falloff. The sharp frame
+is never overwritten, since video needs it intact for the next resample.
+
+The catch is that blurring pulls everything towards the average, and because
+glyph density tracks brightness that turns the picture into a flat wall of
+dense characters rather than a soft-focus photograph. Re-stretching the tonal
+range *after* the blur is what makes it read correctly.
 
 ## Line art, and why it needs no model
 

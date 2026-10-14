@@ -22,6 +22,7 @@
  *        H or ?  key list            Q/Esc  quit
  *        G    guess-the-picture      left/right  prev/next picture
  *        C    mono        I  invert  [ ]  midtone brightness
+ *        B    blur on/off           { }  less / more blur
  */
 
 #include <windows.h>
@@ -47,13 +48,14 @@
 
 #define MODE_ASCII 0
 #define MODE_LINES 1
-#define MODE_BLUR 2
-#define MODE_BRAILLE 3
-#define MODE_BLOCK 4
+#define MODE_BRAILLE 2
+#define MODE_BLOCK 3
+#define MODE_ORIGINAL 4            /* the picture itself, no characters */
 #define MODE_COUNT 5
 
-/* Blur strength, as a fraction of the decoded frame's height. 1.0 is the
-   game's opening state: unrecognisable. */
+/* Blur is not a mode: it is a filter on the source frame, so it composes
+   with whichever mode is drawing. Strength is a fraction of the decoded
+   frame's height; 1.0 is the game's opening state, unrecognisable. */
 #define BLUR_DEFAULT 0.35f
 #define BLUR_MAX_FRAC 0.10          /* radius at amount 1.0 */
 #define BLUR_GAME_STEP 0.72f        /* Space multiplies the blur by this */
@@ -150,7 +152,8 @@ typedef struct {
     int slideshow;
     double av_offset;                   /* audio lead, seconds */
     float line_thresh;                  /* line art: ink this much edge */
-    float blur;                         /* blur mode: 0..1 */
+    float blur;                         /* display blur, 0..1 */
+    int game_blur_mode;                 /* game reveals focus, not cells */
     float game_blur;                    /* the game's current blur */
     double seek_to;                     /* pending debounced seek */
     int seek_pending;
@@ -340,6 +343,15 @@ static int blur_frame(int radius)
     }
     g.blurred_r = radius;
     return 1;
+}
+
+/* How much blur to apply right now. During the game this is the reveal;
+   otherwise it is whatever the user dialled in. Original mode has no cells
+   to uncover, so there the game always reveals focus. */
+static float effective_blur(void)
+{
+    if (g.game && (g.game_blur_mode || g.mode == MODE_ORIGINAL)) return g.game_blur;
+    return g.blur;
 }
 
 static void clear_band(void *ctx, int y0, int y1);
@@ -1401,6 +1413,62 @@ static void parallel_rows(BandFn fn, void *ctx, int y0, int y1)
     }
 }
 
+/* Original mode: the picture itself, scaled to fit, no characters at all.
+ *
+ * Unlike every other mode this one has no cell grid, so it fits with *square*
+ * pixels rather than the 1:2 terminal cell. Useful for checking the art
+ * against its source - and it still honours blur, mono and invert, which are
+ * deliberate choices rather than part of the ASCII conversion. */
+typedef struct { int ox, oy, aw, ah; } FitRect;
+
+static FitRect fit_rect(void)
+{
+    FitRect f;
+    double sx = (double)g.dib_w / g.dec_w, sy = (double)g.dib_h / g.dec_h;
+    double sc = sx < sy ? sx : sy;
+    f.aw = imax(1, (int)(g.dec_w * sc));
+    f.ah = imax(1, (int)(g.dec_h * sc));
+    f.ox = (g.dib_w - f.aw) / 2;
+    f.oy = (g.dib_h - f.ah) / 2;
+    return f;
+}
+
+static void original_band(void *vctx, int y0, int y1)
+{
+    const FitRect *f = (const FitRect *)vctx;
+    const unsigned char *src = active_frame();
+    int sw = g.dec_w, sh = g.dec_h;
+
+    for (int y = y0; y < y1; y++) {
+        int sy0 = (int)((long long)y * sh / f->ah);
+        int sy1 = (int)((long long)(y + 1) * sh / f->ah);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        unsigned int *dst = g.pixels + (size_t)(f->oy + y) * g.dib_w + f->ox;
+        for (int x = 0; x < f->aw; x++) {
+            int sx0 = (int)((long long)x * sw / f->aw);
+            int sx1 = (int)((long long)(x + 1) * sw / f->aw);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            unsigned int r = 0, gg = 0, b = 0, n = 0;
+            for (int yy = sy0; yy < sy1; yy++) {
+                const unsigned char *row = src + (size_t)yy * sw * 3;
+                for (int xx = sx0; xx < sx1; xx++) {
+                    r += row[xx * 3]; gg += row[xx * 3 + 1]; b += row[xx * 3 + 2];
+                    n++;
+                }
+            }
+            unsigned char R = (unsigned char)(r / n);
+            unsigned char G = (unsigned char)(gg / n);
+            unsigned char B = (unsigned char)(b / n);
+            if (g.mono) {
+                unsigned char L = (unsigned char)((54u * R + 183u * G + 19u * B) >> 8);
+                R = G = B = L;
+            }
+            if (g.invert) { R = 255 - R; G = 255 - G; B = 255 - B; }
+            dst[x] = ((unsigned int)R << 16) | ((unsigned int)G << 8) | B;
+        }
+    }
+}
+
 static void clear_band(void *ctx, int y0, int y1)
 {
     (void)ctx;
@@ -1432,8 +1500,8 @@ static void render(void)
     if (!g.have_frame || !g.pixels) return;
 
     int ch, cw;
-    if (g.game && g.mode == MODE_BLUR) {
-        /* The blur game keeps full resolution and takes the focus away
+    if (g.game && (g.game_blur_mode || g.mode == MODE_ORIGINAL)) {
+        /* The focus reveal keeps full resolution and takes sharpness away
            instead, so the grid is the ordinary one. */
         ch = g.cell_h;
         cw = imax(1, ch / 2);
@@ -1484,12 +1552,12 @@ static void render(void)
     }
     if (!g.lum || !g.lumb || !g.cellrgb) return;
 
-    /* Blur mode works on a blurred copy of the frame, so every later stage -
+    /* Blur works on a blurred copy of the frame, so every later stage -
        glyph matching, cell colour, everything - simply sees a softer picture
        and needs no special case. */
     g.blurred_r = 0;
-    if (g.mode == MODE_BLUR) {
-        float amount = g.game ? g.game_blur : g.blur;
+    {
+        float amount = effective_blur();
         int radius = (int)(amount * BLUR_MAX_FRAC * g.dec_h + 0.5);
         if (radius > 0 && blur_frame(radius) && g.levels) {
             /* Blurring pulls everything towards the average, and since glyph
@@ -1498,6 +1566,16 @@ static void render(void)
                keeps it reading as a defocused photograph instead. */
             auto_levels_buf(g.frameb);
         }
+    }
+
+    if (g.mode == MODE_ORIGINAL) {
+        FitRect f = fit_rect();
+        g.cols = f.aw;
+        g.rows = f.ah;
+        parallel_rows(clear_band, NULL, 0, g.dib_h);
+        parallel_rows(original_band, &f, 0, f.ah);
+        draw_scrub_bar();
+        return;
     }
 
     resample(sub_w, sub_h, cols, rows);
@@ -1649,7 +1727,7 @@ static const wchar_t *mode_name(void)
     if (g.mode == MODE_BLOCK) return L"blocks";
     if (g.mode == MODE_BRAILLE) return L"braille";
     if (g.mode == MODE_LINES) return L"line art";
-    if (g.mode == MODE_BLUR) return L"blur";
+    if (g.mode == MODE_ORIGINAL) return L"original";
     return g.cell_h >= SHAPE_MIN_CELL ? L"ascii (shape)" : L"ascii (tone)";
 }
 
@@ -1774,7 +1852,7 @@ static void change_picture(int delta)
    keeps every cell and takes the blur off instead. */
 static void game_reveal_step(void)
 {
-    if (g.mode == MODE_BLUR) {
+    if (g.game_blur_mode || g.mode == MODE_ORIGINAL) {
         g.game_blur *= BLUR_GAME_STEP;
         if (g.game_blur < BLUR_GAME_FLOOR) g.game_blur = 0.0f;
         return;
@@ -1829,7 +1907,7 @@ static int zoom_level(void)
 
 static int game_level(void)
 {
-    if (g.mode != MODE_BLUR) return zoom_level();
+    if (!(g.game_blur_mode || g.mode == MODE_ORIGINAL)) return zoom_level();
     if (g.game_blur <= BLUR_GAME_FLOOR) return 1;
     double span = log(1.0 / BLUR_GAME_FLOOR);
     double lvl = 100.0 * log(g.game_blur / BLUR_GAME_FLOOR) / span;
@@ -1872,14 +1950,24 @@ static void update_title(void)
             _snwprintf(extra, 127, L" - %s elapsed, -%s left%s%s - a/v %+.2fs", a, b,
                        g.playing ? L"" : L" (paused)", snd, g.av_offset);
         }
+        /* Original mode has no cell grid, so report pixels instead. */
+        wchar_t grid[64];
+        if (g.mode == MODE_ORIGINAL)
+            _snwprintf(grid, 63, L"%dx%d px", g.cols, g.rows);
+        else
+            _snwprintf(grid, 63, L"%dx%d cells (%dpx, level %d)",
+                       g.cols, g.rows, g.cell_h, zoom_level());
+
+        wchar_t blurtxt[32] = L"";
+        if (g.blur > 0.0f) _snwprintf(blurtxt, 31, L" - blur %.2f", g.blur);
+
         _snwprintf(g.status, 255,
-                   L"ASCIIArt - %s - %dx%d cells (%dpx, level %d) - %s - %s%s%s"
-                   L" - midtone %.2f%s%s",
-                   base[0] ? base : L"(nothing open)", g.cols, g.rows, g.cell_h,
-                   zoom_level(), mode_name(),
+                   L"ASCIIArt - %s - %s - %s - %s%s%s%s - midtone %.2f%s%s",
+                   base[0] ? base : L"(nothing open)", grid, mode_name(),
                    g.mono ? L"mono" : L"colour",
                    g.invert ? L" - inverted" : L"",
                    g.levels ? L" - auto-levels" : L"",
+                   blurtxt,
                    g.out_gamma, extra,
                    g.slideshow ? L" - slideshow" : L"");
     }
@@ -2002,10 +2090,10 @@ static void draw_help(HDC dc)
     const wchar_t **lines;
     static const wchar_t *normal_lines[] = {
         L"  + / -  or wheel    zoom  (4-48 px cells)",
-        L"  M                  mode: ascii / line art / blur /",
-        L"                     braille / blocks",
-        L"  [  ]               midtones  (line art: edge threshold,",
-        L"                     blur mode: how much blur)",
+        L"  M                  mode: ascii / line art / braille /",
+        L"                     blocks / original",
+        L"  B                  blur on / off   { } less / more",
+        L"  [  ]               midtones  (line art: edge threshold)",
         L"  left / right       previous / next picture in the folder",
         L"  C                  colour / monochrome",
         L"  I                  invert",
@@ -2029,7 +2117,7 @@ static void draw_help(HDC dc)
     lines = normal_lines;
     static const wchar_t *game_lines[] = {
         L"  Space             reveal a bit more",
-        L"                    (blur mode: take the blur off instead)",
+        L"  B                 switch reveal: more cells / less blur",
         L"  N                 another picture",
         L"  R                 start this one over",
         L"  Enter             give up, show what it was",
@@ -2142,12 +2230,30 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case '-': case '_': zoom(-1); break;
         case 'c': case 'C': g.mono = !g.mono; break;
         case 'i': case 'I': g.invert = !g.invert; break;
+        case 'b': case 'B':
+            if (g.game) {
+                /* switch which way the game reveals */
+                g.game_blur_mode = !g.game_blur_mode;
+                g.game_cols = 1;
+                g.game_blur = 1.0f;
+            } else {
+                g.blur = g.blur > 0.0f ? 0.0f : BLUR_DEFAULT;
+            }
+            break;
+        case '{': {
+            float *b = g.game ? &g.game_blur : &g.blur;
+            *b = clampf(*b * 0.75f, 0.0f, 1.0f);
+            if (*b < BLUR_GAME_FLOOR) *b = 0.0f;
+            break;
+        }
+        case '}': {
+            float *b = g.game ? &g.game_blur : &g.blur;
+            *b = clampf(*b < BLUR_GAME_FLOOR ? BLUR_GAME_FLOOR : *b * 1.333f,
+                        0.0f, 1.0f);
+            break;
+        }
         case '[':
-            if (g.mode == MODE_BLUR) {
-                float *b = g.game ? &g.game_blur : &g.blur;
-                *b = clampf(*b * 0.75f, 0.0f, 1.0f);
-                if (*b < BLUR_GAME_FLOOR) *b = 0.0f;
-            } else if (g.mode == MODE_LINES) {
+            if (g.mode == MODE_LINES) {
                 g.line_thresh = clampf(g.line_thresh * 0.8f, 0.005f, 1.0f);
             } else {
                 g.out_gamma = clampf(g.out_gamma + 0.06f, 0.2f, 2.0f);
@@ -2155,11 +2261,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case ']':
-            if (g.mode == MODE_BLUR) {
-                float *b = g.game ? &g.game_blur : &g.blur;
-                *b = clampf(*b < BLUR_GAME_FLOOR ? BLUR_GAME_FLOOR : *b * 1.333f,
-                            0.0f, 1.0f);
-            } else if (g.mode == MODE_LINES) {
+            if (g.mode == MODE_LINES) {
                 g.line_thresh = clampf(g.line_thresh * 1.25f, 0.005f, 1.0f);
             } else {
                 g.out_gamma = clampf(g.out_gamma - 0.06f, 0.2f, 2.0f);
@@ -2225,8 +2327,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.audio_on = 1;
             g.av_offset = AV_OFFSET_DEFAULT;
             g.line_thresh = LINE_THRESH_DEFAULT;
-            g.blur = BLUR_DEFAULT;
+            g.blur = 0.0f;
             g.game_blur = 1.0f;
+            g.game_blur_mode = 0;
             build_tone_tables();
             if (was_game && g.path[0]) open_media(g.path, 0);
             break;
@@ -2362,7 +2465,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     g.have_ffplay = 1;   /* assumed; a missing ffplay just never starts */
     g.av_offset = AV_OFFSET_DEFAULT;
     g.line_thresh = LINE_THRESH_DEFAULT;
-    g.blur = BLUR_DEFAULT;
+    g.blur = 0.0f;              /* off until asked for; B turns it on */
     g.game_blur = 1.0f;
 
     WNDCLASSEXW wc;
@@ -2414,7 +2517,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
             g.mode = !wcscmp(m, L"block") ? MODE_BLOCK
                    : !wcscmp(m, L"braille") ? MODE_BRAILLE
                    : !wcscmp(m, L"lines") ? MODE_LINES
-                   : !wcscmp(m, L"blur") ? MODE_BLUR : MODE_ASCII;
+                   : !wcscmp(m, L"original") ? MODE_ORIGINAL : MODE_ASCII;
         }
         else if (argv[i][0] != L'-') infile = argv[i];
     }

@@ -24,10 +24,11 @@ Press **H** in the app for the key list. In short:
 | key | |
 |---|---|
 | `+` `-` or wheel | zoom, 2–600 px cells |
-| `M` | mode: ascii / line art / blur / braille / blocks |
+| `M` | mode: ascii / line art / braille / blocks / original |
 | `←` `→` | previous / next picture in the folder |
 | `C` / `I` | colour or mono / invert |
-| `[` `]` | brighter / darker midtones (line art: edge threshold; blur: amount) |
+| `[` `]` | brighter / darker midtones (line art: edge threshold) |
+| `B` / `{` `}` | blur on-off / less / more |
 | `A` | mute / unmute video sound |
 | `;` `'` | nudge the audio earlier / later |
 | `L` | auto-levels on/off |
@@ -97,17 +98,18 @@ Zoom is reported as a **level** from 1 to 100, where 100 is the opening state
 and 1 is fully revealed. It is logarithmic, because both reveals progress
 geometrically.
 
-**Two ways to reveal**, picked by the current mode. In the normal modes the
-picture starts as one giant character and `Space` adds cells. In **blur mode**
-it keeps full resolution and starts out of focus instead, with `Space` taking
-the blur off — about 17 presses from unrecognisable to sharp. `M` switches
-between them mid-game.
+**Two ways to reveal**, swapped with `B`. By default the picture starts as
+one giant character and `Space` adds cells. The other way keeps full
+resolution and starts out of focus, with `Space` taking the blur off — about
+17 presses from unrecognisable to sharp. `original` mode has no cells to
+uncover, so there it always reveals focus.
 
 **Modes.** `ascii` matches glyph shapes to the image; `line art` draws only
-edges, using the character that matches each edge's direction; `blur` renders
-a defocused copy of the picture; `braille` uses 2×4 dithered dots (drawn, not
-from a font — Consolas has no braille); `blocks` fills each cell with a solid
-colour. The terminal's `half` and `quad` modes
+edges, using the character that matches each edge's direction; `braille` uses
+2×4 dithered dots (drawn, not from a font — Consolas has no braille);
+`blocks` fills each cell with a solid colour; `original` is the picture
+itself, no characters at all — handy for comparing the art against its
+source. With auto-levels off, `original` is pixel-identical to the file. The terminal's `half` and `quad` modes
 are deliberately *not* here: those exist only to work around a terminal cell
 having one foreground and one background colour, which this app isn't subject
 to — `blocks` is the equivalent and is strictly better.
@@ -316,7 +318,10 @@ During playback: **q** or **Esc** quits, **space** pauses.
 
 ## Blur
 
-![blur game](docs/blur-game.png)
+Blur is **not a mode** — it is a filter on the source frame, so it composes
+with whichever mode is drawing. `B` toggles it, `{` and `}` set the amount.
+
+![blur composes with every mode](docs/blur-orthogonal.png)
 
 A separable box blur over the decoded frame, with running sums so each pass
 costs the same whatever the radius — the game opens at a radius of tens of

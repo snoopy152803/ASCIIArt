@@ -61,8 +61,27 @@ audio latency differs. `-av <seconds>` sets it from the command line.
 old code also blocked the UI thread for ~160 ms waiting on the first frame of
 the new position — so holding `,` or `.` queued one of those per press. Now
 the target is noted and acted on once the keys go quiet, and the seek does not
-wait for its first frame: the current picture stays up until the new ones
-arrive.
+wait for its first frame.
+
+Not waiting is only an improvement if there is still something to draw, and
+for a long time there was not: reopening the file cleared the "we have a
+frame" flag, so every seek dropped the window to the title screen until
+ffmpeg produced the new frame — 130 ms on a small clip and **1.4 seconds on a
+4K one**, which read as the picture vanishing and coming back. It showed up
+most on short clips, because seeking past either end of a two-second GIF
+always lands back at 0. The decoded frame is now kept until a new one
+replaces it:
+
+| clip | gap before the new frame | title screen shown, before | after |
+|---|---|---|---|
+| `anim.gif` 320×240, seek to 0 | 139 ms | 126 ms | **0 ms** |
+| `clip.mp4` 640×480, seek to 3s | 207 ms | 147 ms | **0 ms** |
+| 3840×2160 mp4, seek to 40s | 2872 ms | 1434 ms | **0 ms** |
+
+The same applies to a file that cannot be decoded at all — an `.m4a`, say,
+which has no picture in it. Opening one now reports the error and leaves what
+you were looking at exactly as it was, down to the pixel, instead of clearing
+the window behind the message box.
 
 **Monochrome** (`C`) uses each cell's own grey level, not white. In ascii and
 braille either would look the same, because the glyph carries the brightness
@@ -120,6 +139,18 @@ menu so you can launch it by name:
 ```
 powershell -ExecutionPolicy Bypass -File install-shortcut.ps1
 ```
+
+**The icon is the renderer's own output**, which takes some care at small
+sizes. Two things had it coming out as a smear in the taskbar. The glyphs
+were drawn with a proportional font onto a 1:2 grid, so each one overran its
+neighbour instead of tiling; and the mid sizes were given seven columns to
+work with, which is not a letter 'A', it is seven characters. Character art
+now needs ~30 columns to be attempted at all, so only 256 and 128 px get it —
+48 and 64 px, which is what a 150% display asks the taskbar for, fall back to
+a plain bold glyph. Sizes run 16/20/24/32/40/48/64/128/256 so Windows always
+has an exact match rather than scaling the nearest one.
+
+![icon at every size](docs/icon-sizes.png)
 
 **It declares itself DPI-aware.** Without that, Windows hands a scaled display
 a smaller virtual client area and bitmap-stretches the result: the art is

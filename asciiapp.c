@@ -562,11 +562,52 @@ static int looks_like_video(const wchar_t *path)
     return 0;
 }
 
+/* Everything open_media_ex overwrites before it can know whether the new
+   file is decodable at all. */
+typedef struct {
+    int is_video, dec_w, dec_h, fps_num, have_frame, frame_w, frame_h;
+    double duration, position, play_origin;
+    unsigned char *frame;
+} MediaState;
+
+/* Put the previous file back. close_media has already stopped whatever was
+   running, so playback does not resume - but the frame stays on screen. */
+static void open_restore(const MediaState *p)
+{
+    if (g.frame != p->frame) { free(g.frame); g.frame = p->frame; }
+    g.frame_w = p->frame_w;
+    g.frame_h = p->frame_h;
+    g.have_frame = p->have_frame;
+    g.is_video = p->is_video;
+    g.dec_w = p->dec_w;
+    g.dec_h = p->dec_h;
+    g.fps_num = p->fps_num;
+    g.duration = p->duration;
+    g.position = p->position;
+    g.play_origin = p->play_origin;
+    g.playing = 0;
+}
+
 /* Open a file and start decoding into g.frame at g.dec_w x g.dec_h. */
 static int open_media_ex(const wchar_t *path, double start_at, int wait_first)
 {
     close_media();
-    g.have_frame = 0;
+    /* g.have_frame deliberately survives this. A non-blocking seek reopens
+       ffmpeg and reuses the same buffer, so the frame already on screen is
+       still a perfectly good thing to show while the new decode spins up;
+       clearing it here dropped the window back to the splash screen for the
+       couple of hundred milliseconds that took, which read as the picture
+       vanishing and coming back. It is cleared below on the paths that
+       really do leave nothing valid to draw.
+
+       The same goes for a file that turns out not to be openable at all -
+       an .m4a, say, which has no picture in it. The fields describing the
+       decode are overwritten long before we find that out, so keep a copy
+       and put them back; otherwise one bad file in the open dialog threw
+       away whatever you were already looking at. */
+    MediaState prev = { g.is_video, g.dec_w, g.dec_h, g.fps_num,
+                        g.have_frame, g.frame_w, g.frame_h,
+                        g.duration, g.position, g.play_origin, g.frame };
 
     /* ffprobe costs a process spawn and can block for a while. Seeking
        re-opens the same file over and over, so remember the answer - this is
@@ -606,14 +647,18 @@ static int open_media_ex(const wchar_t *path, double start_at, int wait_first)
     g.fps_num = (int)(fps + 0.5);
 
     /* Keep the existing buffer when the size is unchanged: a seek can then
-       carry on showing the current frame instead of a flash of garbage. */
+       carry on showing the current frame instead of a flash of garbage. A
+       different size needs a new buffer, but the old one is not freed until
+       the open has succeeded - an undecodable file must leave the picture
+       that is already up exactly as it was. */
     if (!g.frame || dw != g.frame_w || dh != g.frame_h) {
-        free(g.frame);
-        g.frame = (unsigned char *)malloc((size_t)dw * dh * 3);
-        if (!g.frame) return 0;
-        memset(g.frame, 0, (size_t)dw * dh * 3);
+        unsigned char *nb = (unsigned char *)malloc((size_t)dw * dh * 3);
+        if (!nb) { open_restore(&prev); return 0; }
+        memset(nb, 0, (size_t)dw * dh * 3);
+        g.frame = nb;
         g.frame_w = dw;
         g.frame_h = dh;
+        g.have_frame = 0;       /* the old contents are the wrong size now */
         wait_first = 1;                 /* nothing to show yet, so we must */
     }
 
@@ -638,7 +683,7 @@ static int open_media_ex(const wchar_t *path, double start_at, int wait_first)
     }
     DWORD want = (DWORD)((size_t)dw * dh * 3 * 24);
     if (want > (48u << 20)) want = 48u << 20;
-    if (!spawn(cmd, &g.pipe, &g.proc, want)) return 0;
+    if (!spawn(cmd, &g.pipe, &g.proc, want)) { open_restore(&prev); return 0; }
 
     /* Sound starts here, not after the first frame: reading that frame
        blocks while ffmpeg (already running under -re) gets going, so
@@ -655,10 +700,12 @@ static int open_media_ex(const wchar_t *path, double start_at, int wait_first)
         if (!read_exact(g.pipe, g.frame, (size_t)dw * dh * 3)) {
             close_media();
             wcscpy(g.path, previous);
+            open_restore(&prev);
             return 0;
         }
         g.have_frame = 1;
     }
+    if (prev.frame != g.frame) free(prev.frame);        /* new size: let go */
     if (!g.is_video && g.levels) auto_levels_buf(g.frame);
 
     if (g.is_video) {
@@ -1775,6 +1822,7 @@ static int pump_video(void)
     long long ready = avail / nbytes;
     for (long long i = 0; i < ready; i++) {
         if (!read_exact(g.pipe, g.frame, nbytes)) { open_media(g.path, 0); return 0; }
+        g.have_frame = 1;               /* a seek may have arrived here first */
         g.frames_read++;
         if (i + 1 < ready) g.frames_dropped++;      /* superseded before drawing */
     }
@@ -2503,6 +2551,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!wcscmp(argv[i], L"-c") && i + 1 < argc) g.cell_h = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"-bench") && i + 1 < argc) i++;   /* read below */
         else if (!wcscmp(argv[i], L"-playtest") && i + 1 < argc) i++;
+        else if (!wcscmp(argv[i], L"-seektest") && i + 1 < argc) i++;
+        else if (!wcscmp(argv[i], L"-badopen") && i + 1 < argc) i++;
         else if (!wcscmp(argv[i], L"-w") && i + 1 < argc) g.whiten = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-g") && i + 1 < argc) g.out_gamma = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-splash")) { }   /* read below */
@@ -2530,11 +2580,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     build_bank();
     resize_dib(g.hwnd);
 
-    int bench = 0, splash = 0;
-    double playtest = 0;
+    int bench = 0, splash = 0, seektest = 0;
+    double playtest = 0, seekto = 0;
+    const wchar_t *badopen = NULL;
     for (int i = 1; i < argc; i++) {
         if (!wcscmp(argv[i], L"-bench") && i + 1 < argc) bench = _wtoi(argv[i + 1]);
         if (!wcscmp(argv[i], L"-playtest") && i + 1 < argc) playtest = _wtof(argv[i + 1]);
+        if (!wcscmp(argv[i], L"-seektest") && i + 1 < argc) {
+            seektest = 1;
+            seekto = _wtof(argv[i + 1]);
+        }
+        if (!wcscmp(argv[i], L"-badopen") && i + 1 < argc) badopen = argv[i + 1];
         if (!wcscmp(argv[i], L"-splash")) splash = 1;
     }
 
@@ -2580,6 +2636,48 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
                         el, g.frames_read, drawn, g.frames_dropped,
                         (double)g.fps_num, g.frames_read / el, drawn / el,
                         (g.frames_read / el) / (g.fps_num > 0 ? g.fps_num : 25));
+                fclose(f);
+            }
+            LocalFree(argv);
+            close_media();
+            return 0;
+        }
+
+        /* Opening something undecodable should leave the picture that is
+           already up alone, so the output here must match a plain render. */
+        if (badopen) open_media(badopen, 0);
+
+        if (seektest) {
+            /* A seek the way the window does it: non-blocking, so playback
+               carries on while ffmpeg restarts. What matters is whether
+               anything is left to draw in the meantime - when there is not,
+               WM_PAINT falls through to the splash screen and the picture
+               appears to vanish and come back. */
+            LARGE_INTEGER t0, now;
+            QueryPerformanceFrequency(&g.qpf);
+            for (int i = 0; i < 20; i++) { pump_video(); Sleep(10); }
+
+            QueryPerformanceCounter(&t0);
+            open_media_ex(g.path, seekto, 0);
+            double blank = -1;
+            int was_blank = !g.have_frame;
+            for (;;) {
+                QueryPerformanceCounter(&now);
+                double el = 1000.0 * (now.QuadPart - t0.QuadPart) / g.qpf.QuadPart;
+                if (pump_video() > 0) { render(); if (blank < 0) blank = el; break; }
+                if (el > 5000) break;
+                Sleep(1);
+            }
+            QueryPerformanceCounter(&now);
+            double gap = 1000.0 * (now.QuadPart - t0.QuadPart) / g.qpf.QuadPart;
+            FILE *f = _wfopen(out, L"w");
+            if (f) {
+                fprintf(f, "seek to %.2fs\n"
+                           "first frame after %.0f ms\n"
+                           "nothing to draw during the gap: %s\n"
+                           "splash would show for %.0f ms\n",
+                        seekto, gap, was_blank ? "yes" : "no",
+                        was_blank ? gap : 0.0);
                 fclose(f);
             }
             LocalFree(argv);

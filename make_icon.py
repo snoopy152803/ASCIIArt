@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Generate asciiapp.ico.
 
-The large sizes are a real render: a letter 'A' put through this project's own
-shape-matching renderer, so the icon is literally made of characters. The
-small sizes drop to a plain bold glyph, because at 16 px a grid of characters
-is indistinguishable from noise.
+The two large sizes are a real render: a letter 'A' put through this
+project's own shape-matching renderer, so the icon is literally made of
+characters. Everything 64 px and below drops to a plain bold glyph, because
+a grid of characters needs roughly 8 px per cell to read as anything, and
+below that it degrades into the smear this icon used to show in the taskbar.
 
     python make_icon.py
 """
@@ -23,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BG = (14, 16, 22)
 INK = (126, 214, 255)
 WARM = (255, 196, 92)
+ART_COLS = 32              # fewer than ~30 and the 'A' stops reading
 
 
 def _font(size, bold=True):
@@ -59,6 +61,31 @@ def source_art(px=512):
     return img
 
 
+def _mono(size):
+    """A monospace face, so a character grid actually lines up.
+
+    The art is laid out on 1:2 cells like the renderer's own output, which
+    only looks like a grid if every glyph advances exactly one cell. A
+    proportional face overlaps its neighbours instead, which is what turned
+    the old icon into an illegible smear."""
+    for name in ("consola.ttf", "cour.ttf", "lucon.ttf"):
+        p = os.path.join(r"C:\Windows\Fonts", name)
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, max(6, int(round(size))))
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _fit_mono(cell_w):
+    """The largest monospace size whose advance still fits one cell."""
+    size = max(6, int(round(cell_w / 0.55)))          # Consolas is 0.55 em wide
+    while size > 6 and _mono(size).getlength("M") > cell_w:
+        size -= 1
+    return _mono(size)
+
+
 def render_ascii_tile(size, cols):
     """Run the project's renderer and draw the resulting glyphs into a tile."""
     chars, bank = glyphs.load()
@@ -71,8 +98,11 @@ def render_ascii_tile(size, cols):
     cw, chh = size / cols, size / rows
     tile = Image.new("RGB", (size, size), BG)
     d = ImageDraw.Draw(tile)
-    f = _font(max(6, int(chh * 0.95)), bold=False)
+    f = _fit_mono(cw)
     for y in range(rows):
+        # One baseline per row, so characters sit on a line instead of each
+        # floating to the middle of its own bounding box.
+        base = (y + 1) * chh - chh * 0.22
         for x in range(cols):
             c = chr(int(cells[y, x]))
             if c == " ":
@@ -82,7 +112,8 @@ def render_ascii_tile(size, cols):
             r = min(255, (r + INK[0] * 2) // 2)
             g = min(255, (g + INK[1] * 2) // 2)
             b = min(255, (b + INK[2] * 2) // 2)
-            d.text((x * cw, y * chh - chh * 0.1), c, font=f, fill=(r, g, b))
+            d.text((x * cw + cw / 2, base), c, font=f, fill=(r, g, b),
+                   anchor="ms")
     return tile
 
 
@@ -90,12 +121,15 @@ def simple_tile(size):
     """A plain bold 'A' for the sizes where characters cannot be resolved."""
     tile = Image.new("RGB", (size, size), BG)
     d = ImageDraw.Draw(tile)
-    f = _font(int(size * 0.8))
+    f = _font(int(size * 0.74))
     box = d.textbbox((0, 0), "A", font=f)
     d.text(((size - (box[2] - box[0])) / 2 - box[0],
             (size - (box[3] - box[1])) / 2 - box[1]), "A", font=f, fill=INK)
-    # a couple of character-art specks, so it still hints at the idea
-    d.text((size * 0.06, size * 0.60), "#", font=_font(int(size * 0.3)), fill=WARM)
+    # A speck of character art, so it still hints at the idea - but only
+    # where there is room for it to be a shape rather than a stray pixel.
+    if size >= 32:
+        d.text((size * 0.06, size * 0.58), "#", font=_font(int(size * 0.28)),
+               fill=WARM)
     return tile
 
 
@@ -112,10 +146,14 @@ def rounded(img, radius_frac=0.18):
 
 def main():
     layers = []
-    for size in (256, 128, 64, 48):
-        cols = max(7, size // 12)
-        layers.append(rounded(render_ascii_tile(size, cols), 0.16))
-    for size in (32, 24, 16):
+    # Character art only at the two large sizes. What decides whether it
+    # reads as an 'A' is the number of cells, not the pixel size - below
+    # about 30 columns the letter stops being a letter. Windows picks a
+    # layer by the size it wants, so the mid sizes matter: a 150% display
+    # asks the taskbar for 48 px, which is where the old smear showed up.
+    for size in (256, 128):
+        layers.append(rounded(render_ascii_tile(size, ART_COLS), 0.16))
+    for size in (64, 48, 40, 32, 24, 20, 16):
         layers.append(rounded(simple_tile(size), 0.14))
 
     out = os.path.join(HERE, "asciiapp.ico")

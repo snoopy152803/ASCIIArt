@@ -25,9 +25,13 @@ ifeq ($(strip $(APPDATA)),)
     export APPDATA := $(USERPROFILE)\AppData\Roaming
   else ifneq ($(strip $(HOMEDRIVE)$(HOMEPATH)),)
     export APPDATA := $(HOMEDRIVE)$(HOMEPATH)\AppData\Roaming
-  else
+  else ifneq ($(strip $(USERNAME)),)
     export APPDATA := C:\Users\$(USERNAME)\AppData\Roaming
   endif
+  # If none of those are set either, APPDATA is left alone: exporting a path
+  # guessed from nothing (C:\Users\\AppData\Roaming, when USERNAME is empty
+  # too) is worse than leaving it unset, because Python then looks for its
+  # site-packages somewhere that definitely does not exist.
 endif
 
 CC      := gcc
@@ -61,9 +65,14 @@ $(RES): asciiapp.rc $(ICON)
 	@echo "  [rc]  asciiapp.rc"
 	@windres asciiapp.rc -O coff -o $@
 
-$(ICON):
+# The icon needs Python with numpy and Pillow, which a plain C build does
+# not otherwise require. If it cannot be rebuilt, say so and carry on with
+# the icon already on disk rather than failing the whole build - but if
+# there is no icon at all, the error is real and stops here.
+$(ICON): make_icon.py
 	@echo "  [py]  make_icon.py"
-	@$(PYTHON) make_icon.py
+	@$(PYTHON) make_icon.py || { test -f $@ && \
+	  echo "  [!!]  make_icon.py failed; keeping the existing $@"; }
 
 icon:
 	@$(PYTHON) make_icon.py

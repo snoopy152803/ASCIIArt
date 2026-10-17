@@ -16,6 +16,7 @@
  * Media is decoded by ffmpeg (must be on PATH), read as raw RGB over a pipe.
  *
  * Keys:  + -  zoom (or wheel)        M  mode: ascii / braille / blocks
+ *        Ctrl + zoom  magnify       Ctrl+arrows / drag  move the view
  *        F    fullscreen             L  auto-levels on/off
  *        Space pause                 ,  .  seek -/+ 5s
  *        Ctrl+O or O  open file      S  save a .bmp
@@ -97,6 +98,9 @@ static float g_rel_of[256];       /* sRGB tone -> relative linear light */
 
 /* ------------------------------------------------------------------- state */
 
+/* A rectangle of the decoded frame: what the magnifier is looking at. */
+typedef struct { int x, y, w, h; } SrcRect;
+
 typedef struct {
     /* glyph bank, for matching: coverage of each glyph on a GW x GH grid */
     float bank[NGLYPH][NSUB];
@@ -131,6 +135,18 @@ typedef struct {
     int blurred_r;           /* radius currently sitting in frameb */
     int dec_w, dec_h, frame_w, frame_h;
     int have_frame;
+
+    /* Magnifier. The cell grid is fixed by the window, so the only way to
+       see more detail is to feed it less picture: view is the part of the
+       frame everything samples from, held as a centre and a factor so it
+       survives a resize or a differently sized video frame. */
+    double view_zoom;        /* 1.0 = the whole frame */
+    double view_cx, view_cy; /* centre of the view, 0..1 of the frame */
+    SrcRect view;            /* the above in frame pixels, this render */
+    int art_x, art_y, art_w, art_h;   /* where the picture landed on screen */
+    int panning;             /* dragging the view about */
+    POINT pan_pt;            /* where the drag started, client pixels */
+    double pan_cx, pan_cy;   /* and the centre it started from */
 
     /* resampling scratch */
     float *lum;              /* (cols*GW) x (rows*GH) luminance 0..1 */
@@ -218,6 +234,106 @@ static void zoom(int dir)
     int next = dir > 0 ? (int)(before * 1.25f + 0.5f) : (int)(before / 1.25f + 0.5f);
     if (next == before) next = before + dir;      /* always move at the small end */
     g.cell_h = clampi(next, CELL_MIN, CELL_MAX);
+}
+
+/* ------------------------------------------------------------- magnifier */
+
+/* Zooming with +/- makes the cells bigger, which means fewer of them: the
+ * picture gets coarser, not closer. Magnifying is the other axis - the grid
+ * stays exactly as it is and the source is cropped, so every cell has fewer
+ * source pixels to average and the detail goes up instead of down. */
+#define VIEW_ZOOM_MAX 64.0
+#define VIEW_MIN_PX 8               /* never crop below this many pixels */
+#define VIEW_STEP 1.25
+
+static int view_minw(void) { return g.dec_w < VIEW_MIN_PX ? g.dec_w : VIEW_MIN_PX; }
+static int view_minh(void) { return g.dec_h < VIEW_MIN_PX ? g.dec_h : VIEW_MIN_PX; }
+
+/* The crop in frame pixels. Both sides are divided by the same factor, so
+   the view keeps the frame's aspect and the geometry below is unaffected. */
+static SrcRect src_rect(void)
+{
+    SrcRect v = { 0, 0, g.dec_w, g.dec_h };
+    double z = g.view_zoom < 1.0 ? 1.0 : g.view_zoom;
+    if (g.dec_w < 1 || g.dec_h < 1) return v;
+    v.w = clampi((int)(g.dec_w / z + 0.5), view_minw(), g.dec_w);
+    v.h = clampi((int)(g.dec_h / z + 0.5), view_minh(), g.dec_h);
+    v.x = clampi((int)(g.view_cx * g.dec_w - v.w / 2.0 + 0.5), 0, g.dec_w - v.w);
+    v.y = clampi((int)(g.view_cy * g.dec_h - v.h / 2.0 + 0.5), 0, g.dec_h - v.h);
+    return v;
+}
+
+/* Keep the centre far enough from the edges that the view stays on the
+   frame. At zoom 1 this pins it to the middle, which is the reset. */
+static void view_clamp(void)
+{
+    double z = g.view_zoom < 1.0 ? 1.0 : g.view_zoom;
+    double halfx = 0.5 / z, halfy = 0.5 / z;
+    if (g.view_cx < halfx) g.view_cx = halfx;
+    if (g.view_cx > 1.0 - halfx) g.view_cx = 1.0 - halfx;
+    if (g.view_cy < halfy) g.view_cy = halfy;
+    if (g.view_cy > 1.0 - halfy) g.view_cy = 1.0 - halfy;
+}
+
+static void view_reset(void)
+{
+    g.view_zoom = 1.0;
+    g.view_cx = g.view_cy = 0.5;
+    g.view = src_rect();
+}
+
+/* Magnify about a point in client pixels, or about the middle when mx < 0.
+   Anchoring on the cursor is what makes the wheel feel like a magnifier
+   rather than a slider: whatever is under the pointer stays under it. */
+static void magnify(int dir, int mx, int my)
+{
+    if (g.dec_w < 1 || g.dec_h < 1) return;
+
+    double z = dir > 0 ? g.view_zoom * VIEW_STEP : g.view_zoom / VIEW_STEP;
+    double zmax = VIEW_ZOOM_MAX;
+    if ((double)g.dec_w / view_minw() < zmax) zmax = (double)g.dec_w / view_minw();
+    if ((double)g.dec_h / view_minh() < zmax) zmax = (double)g.dec_h / view_minh();
+    if (z < 1.0) z = 1.0;
+    if (z > zmax) z = zmax;
+
+    double u = 0.5, v = 0.5;
+    if (mx >= 0 && g.art_w > 0 && g.art_h > 0) {
+        u = clampf((float)(mx - g.art_x) / g.art_w, 0.0f, 1.0f);
+        v = clampf((float)(my - g.art_y) / g.art_h, 0.0f, 1.0f);
+    }
+    /* The frame point currently under that spot has to end up there again. */
+    double fx = g.view.x + u * g.view.w;
+    double fy = g.view.y + v * g.view.h;
+    double nw = g.dec_w / z, nh = g.dec_h / z;
+
+    g.view_zoom = z;
+    g.view_cx = (fx - u * nw + nw / 2.0) / g.dec_w;
+    g.view_cy = (fy - v * nh + nh / 2.0) / g.dec_h;
+    view_clamp();
+    g.view = src_rect();
+}
+
+/* Shift the view by a fraction of itself, so a keypress moves the same
+   visible distance however far in you are. */
+static void view_move(double dx, double dy)
+{
+    if (g.view_zoom <= 1.0) return;
+    g.view_cx += dx / g.view_zoom;
+    g.view_cy += dy / g.view_zoom;
+    view_clamp();
+    g.view = src_rect();
+}
+
+/* The command line's view, applied after the file is open: opening one
+   resets the magnifier, which is what you want when you change picture. */
+static void apply_cli_view(double mag, double cx, double cy)
+{
+    if (mag <= 1.0 && cx == 0.5 && cy == 0.5) return;
+    g.view_zoom = mag < 1.0 ? 1.0 : mag;
+    g.view_cx = cx;
+    g.view_cy = cy;
+    view_clamp();
+    g.view = src_rect();
 }
 
 static void die(const wchar_t *msg)
@@ -638,6 +754,13 @@ static int open_media_ex(const wchar_t *path, double start_at, int wait_first)
     if (dw < 2) dw = 2;
     if (dh < 2) dh = 2;
 
+    /* A seek or a reopen of the same file keeps the magnifier where it
+       was; a different picture starts from the whole frame again. */
+    if (_wcsicmp(path, g.path) != 0) {
+        g.view_zoom = 1.0;
+        g.view_cx = g.view_cy = 0.5;
+    }
+
     g.is_video = looks_like_video(path);
     g.dec_w = dw;
     g.dec_h = dh;
@@ -974,13 +1097,16 @@ static void resample_lum_band(void *vctx, int yy0, int yy1)
     const ResampleCtx *c = (const ResampleCtx *)vctx;
     int sub_w = c->sub_w, sub_h = c->sub_h;
     const unsigned char *src = active_frame();
-    int sw = g.dec_w, sh = g.dec_h;
+    /* The rows are still the frame's, but only the viewport is read: that
+       is the whole of the magnifier as far as the renderer is concerned. */
+    int sw = g.dec_w;
+    SrcRect v = g.view;
 
     for (int y = yy0; y < yy1; y++) {
-        int y0 = y * sh / sub_h, y1 = (y + 1) * sh / sub_h;
+        int y0 = v.y + y * v.h / sub_h, y1 = v.y + (y + 1) * v.h / sub_h;
         if (y1 <= y0) y1 = y0 + 1;
         for (int x = 0; x < sub_w; x++) {
-            int x0 = x * sw / sub_w, x1 = (x + 1) * sw / sub_w;
+            int x0 = v.x + x * v.w / sub_w, x1 = v.x + (x + 1) * v.w / sub_w;
             if (x1 <= x0) x1 = x0 + 1;
             unsigned int r = 0, gg = 0, b = 0, n = 0;
             for (int yy = y0; yy < y1; yy++) {
@@ -1003,13 +1129,14 @@ static void resample_rgb_band(void *vctx, int yy0, int yy1)
     const ResampleCtx *c = (const ResampleCtx *)vctx;
     int cols = c->cols, rows = c->rows;
     const unsigned char *src = active_frame();
-    int sw = g.dec_w, sh = g.dec_h;
+    int sw = g.dec_w;
+    SrcRect v = g.view;
 
     for (int y = yy0; y < yy1; y++) {
-        int y0 = y * sh / rows, y1 = (y + 1) * sh / rows;
+        int y0 = v.y + y * v.h / rows, y1 = v.y + (y + 1) * v.h / rows;
         if (y1 <= y0) y1 = y0 + 1;
         for (int x = 0; x < cols; x++) {
-            int x0 = x * sw / cols, x1 = (x + 1) * sw / cols;
+            int x0 = v.x + x * v.w / cols, x1 = v.x + (x + 1) * v.w / cols;
             if (x1 <= x0) x1 = x0 + 1;
             unsigned int r = 0, gg = 0, b = 0, n = 0;
             for (int yy = y0; yy < y1; yy++) {
@@ -1471,10 +1598,11 @@ typedef struct { int ox, oy, aw, ah; } FitRect;
 static FitRect fit_rect(void)
 {
     FitRect f;
-    double sx = (double)g.dib_w / g.dec_w, sy = (double)g.dib_h / g.dec_h;
+    SrcRect v = g.view;
+    double sx = (double)g.dib_w / v.w, sy = (double)g.dib_h / v.h;
     double sc = sx < sy ? sx : sy;
-    f.aw = imax(1, (int)(g.dec_w * sc));
-    f.ah = imax(1, (int)(g.dec_h * sc));
+    f.aw = imax(1, (int)(v.w * sc));
+    f.ah = imax(1, (int)(v.h * sc));
     f.ox = (g.dib_w - f.aw) / 2;
     f.oy = (g.dib_h - f.ah) / 2;
     return f;
@@ -1484,16 +1612,17 @@ static void original_band(void *vctx, int y0, int y1)
 {
     const FitRect *f = (const FitRect *)vctx;
     const unsigned char *src = active_frame();
-    int sw = g.dec_w, sh = g.dec_h;
+    int sw = g.dec_w;
+    SrcRect v = g.view;
 
     for (int y = y0; y < y1; y++) {
-        int sy0 = (int)((long long)y * sh / f->ah);
-        int sy1 = (int)((long long)(y + 1) * sh / f->ah);
+        int sy0 = v.y + (int)((long long)y * v.h / f->ah);
+        int sy1 = v.y + (int)((long long)(y + 1) * v.h / f->ah);
         if (sy1 <= sy0) sy1 = sy0 + 1;
         unsigned int *dst = g.pixels + (size_t)(f->oy + y) * g.dib_w + f->ox;
         for (int x = 0; x < f->aw; x++) {
-            int sx0 = (int)((long long)x * sw / f->aw);
-            int sx1 = (int)((long long)(x + 1) * sw / f->aw);
+            int sx0 = v.x + (int)((long long)x * v.w / f->aw);
+            int sx1 = v.x + (int)((long long)(x + 1) * v.w / f->aw);
             if (sx1 <= sx0) sx1 = sx0 + 1;
             unsigned int r = 0, gg = 0, b = 0, n = 0;
             for (int yy = sy0; yy < sy1; yy++) {
@@ -1546,6 +1675,10 @@ static void render(void)
 {
     if (!g.have_frame || !g.pixels) return;
 
+    /* Resolve the magnifier once: the bands below all read g.view, and it
+       must not change under them. */
+    g.view = src_rect();
+
     int ch, cw;
     if (g.game && (g.game_blur_mode || g.mode == MODE_ORIGINAL)) {
         /* The focus reveal keeps full resolution and takes sharpness away
@@ -1568,11 +1701,11 @@ static void render(void)
     /* Fit the source aspect into the grid. cell_aspect is exactly ch/cw. */
     double aspect = (double)ch / cw;
     int cols = maxcols;
-    int rows = (int)(cols * (double)g.dec_h / (g.dec_w * aspect) + 0.5);
+    int rows = (int)(cols * (double)g.view.h / (g.view.w * aspect) + 0.5);
     if (rows < 1) rows = 1;
     if (rows > maxrows) {
         rows = maxrows;
-        cols = (int)(rows * aspect * (double)g.dec_w / g.dec_h + 0.5);
+        cols = (int)(rows * aspect * (double)g.view.w / g.view.h + 0.5);
         cols = clampi(cols, 1, maxcols);
     }
     g.cols = cols;
@@ -1605,7 +1738,9 @@ static void render(void)
     g.blurred_r = 0;
     {
         float amount = effective_blur();
-        int radius = (int)(amount * BLUR_MAX_FRAC * g.dec_h + 0.5);
+        /* Scaled to the visible region, not the file, so magnifying does
+           not also sharpen the picture up. */
+        int radius = (int)(amount * BLUR_MAX_FRAC * g.view.h + 0.5);
         if (radius > 0 && blur_frame(radius) && g.levels) {
             /* Blurring pulls everything towards the average, and since glyph
                density tracks brightness that turns the picture into a flat
@@ -1619,6 +1754,7 @@ static void render(void)
         FitRect f = fit_rect();
         g.cols = f.aw;
         g.rows = f.ah;
+        g.art_x = f.ox; g.art_y = f.oy; g.art_w = f.aw; g.art_h = f.ah;
         parallel_rows(clear_band, NULL, 0, g.dib_h);
         parallel_rows(original_band, &f, 0, f.ah);
         draw_scrub_bar();
@@ -1640,6 +1776,9 @@ static void render(void)
     int art_w = cols * cw, art_h = rows * ch;
     int ox = (g.dib_w - art_w) / 2, oy = (g.dib_h - art_h) / 2;
     int stride = g.dib_w;
+    /* Remembered so the wheel can magnify about whatever is under the
+       pointer rather than about the middle. */
+    g.art_x = ox; g.art_y = oy; g.art_w = art_w; g.art_h = art_h;
 
     RowJob job = { 0, rows, cols, rows, cw, ch, ox, oy, stride, sub_w, sub_h, shape };
     render_rows_parallel(job);
@@ -2006,11 +2145,14 @@ static void update_title(void)
             _snwprintf(grid, 63, L"%dx%d cells (%dpx, level %d)",
                        g.cols, g.rows, g.cell_h, zoom_level());
 
-        wchar_t blurtxt[32] = L"";
-        if (g.blur > 0.0f) _snwprintf(blurtxt, 31, L" - blur %.2f", g.blur);
+        wchar_t blurtxt[48] = L"";
+        if (g.blur > 0.0f) _snwprintf(blurtxt, 47, L" - blur %.2f", g.blur);
+        wchar_t magtxt[32] = L"";
+        if (g.view_zoom > 1.001)
+            _snwprintf(magtxt, 31, L" - magnified x%.1f", g.view_zoom);
 
         _snwprintf(g.status, 255,
-                   L"ASCIIArt - %s - %s - %s - %s%s%s%s - midtone %.2f%s%s",
+                   L"ASCIIArt - %s - %s - %s - %s%s%s%s%s - midtone %.2f%s%s",
                    base[0] ? base : L"(nothing open)", grid, mode_name(),
                    g.mono ? L"mono" : L"colour",
                    g.invert ? L" - inverted" : L"",
@@ -2137,7 +2279,8 @@ static void draw_help(HDC dc)
 {
     const wchar_t **lines;
     static const wchar_t *normal_lines[] = {
-        L"  + / -  or wheel    zoom  (4-48 px cells)",
+        L"  + / -  or wheel    zoom  (bigger cells, so fewer of them)",
+        L"  Ctrl + zoom        magnify: same cells, closer in",
         L"  M                  mode: ascii / line art / braille /",
         L"                     blocks / original",
         L"  B                  blur on / off   { } less / more",
@@ -2153,6 +2296,7 @@ static void draw_help(HDC dc)
         L"  ;  \x27              nudge audio earlier / later",
         L"  P                  slideshow (next picture every 4s)",
         L"  0                  reset everything to defaults",
+        L"  Ctrl+arrows, drag  move the magnified view, Ctrl+0 resets",
         L"  Space              pause video  (click the bar to seek)",
         L"  ,  .               seek back / forward 5s",
         L"  Ctrl+O  or  O      open a file",
@@ -2182,7 +2326,15 @@ static void draw_help(HDC dc)
                              FIXED_PITCH | FF_MODERN, FONT_NAME);
     HGDIOBJ oldfont = SelectObject(dc, font);
 
-    RECT box = { 20, 20, 20 + 430, 20 + 22 * (n + 1) + 10 };
+    /* Measured, not guessed: the list has grown over the life of the app
+       and a fixed 430 px silently clipped the longest lines. */
+    int wmax = 0;
+    for (int i = 0; i < n; i++) {
+        SIZE sz;
+        if (GetTextExtentPoint32W(dc, lines[i], (int)wcslen(lines[i]), &sz) &&
+            sz.cx > wmax) wmax = sz.cx;
+    }
+    RECT box = { 20, 20, 20 + wmax + 24, 20 + 22 * (n + 1) + 10 };
     HBRUSH bg = CreateSolidBrush(RGB(16, 16, 20));
     FillRect(dc, &box, bg);
     DeleteObject(bg);
@@ -2245,6 +2397,20 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_LBUTTONDOWN: {
         int mx = (short)LOWORD(lp), my = (short)HIWORD(lp);
+        int on_bar = g.is_video && g.duration > 0 &&
+                     my >= g.bar_y0 && my <= g.bar_y1;
+        /* Ctrl always drags the view; once magnified a plain drag does too,
+           since outside the scrub bar and the game nothing else wants one. */
+        if (!on_bar && (GetKeyState(VK_CONTROL) < 0 ||
+                        (g.view_zoom > 1.0 && !g.game))) {
+            g.panning = 1;
+            g.pan_pt.x = mx;
+            g.pan_pt.y = my;
+            g.pan_cx = g.view_cx;
+            g.pan_cy = g.view_cy;
+            SetCapture(hwnd);
+            return 0;
+        }
         if (g.is_video && g.duration > 0 && my >= g.bar_y0 && my <= g.bar_y1) {
             int pad = 10, span = g.dib_w - 2 * pad;
             double frac = span > 0 ? (double)(mx - pad) / span : 0;
@@ -2258,12 +2424,67 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_MOUSEWHEEL:
-        zoom(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
+    case WM_MOUSEWHEEL: {
+        int dir = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1;
+        if (LOWORD(wp) & MK_CONTROL) {
+            /* Wheel coordinates arrive in screen space, unlike every other
+               mouse message here. */
+            POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
+            ScreenToClient(hwnd, &p);
+            magnify(dir, p.x, p.y);
+        } else {
+            zoom(dir);
+        }
         InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+        if (g.panning) {
+            int mx = (short)LOWORD(lp), my = (short)HIWORD(lp);
+            if (g.art_w > 0 && g.art_h > 0) {
+                /* Drag the picture, so whatever is under the cursor follows
+                   it: the view has to move the other way. */
+                g.view_cx = g.pan_cx - (double)(mx - g.pan_pt.x)
+                                       / g.art_w / g.view_zoom;
+                g.view_cy = g.pan_cy - (double)(my - g.pan_pt.y)
+                                       / g.art_h / g.view_zoom;
+                view_clamp();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+
+    case WM_LBUTTONUP:
+        if (g.panning) { g.panning = 0; ReleaseCapture(); }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        g.panning = 0;
         return 0;
 
     case WM_KEYDOWN:
+        if (GetKeyState(VK_CONTROL) < 0) {
+            /* Ctrl turns zoom into magnification: the same keys, but the
+               grid stays put and the source is cropped instead. */
+            switch (wp) {
+            case VK_OEM_PLUS: case VK_ADD:
+                magnify(1, -1, -1); break;
+            case VK_OEM_MINUS: case VK_SUBTRACT:
+                magnify(-1, -1, -1); break;
+            case '0': case VK_NUMPAD0:
+                view_reset(); break;
+            case VK_LEFT:  view_move(-0.15, 0); break;
+            case VK_RIGHT: view_move(0.15, 0); break;
+            case VK_UP:    view_move(0, -0.15); break;
+            case VK_DOWN:  view_move(0, 0.15); break;
+            default:
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (wp == VK_LEFT || wp == VK_RIGHT) {
             change_picture(wp == VK_RIGHT ? 1 : -1);
             if (g.game) { g.game_cols = 1; g.game_blur = 1.0f; g.game_reveal = 0; }
@@ -2378,6 +2599,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.blur = 0.0f;
             g.game_blur = 1.0f;
             g.game_blur_mode = 0;
+            view_reset();
             build_tone_tables();
             if (was_game && g.path[0]) open_media(g.path, 0);
             break;
@@ -2513,6 +2735,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     g.have_ffplay = 1;   /* assumed; a missing ffplay just never starts */
     g.av_offset = AV_OFFSET_DEFAULT;
     g.line_thresh = LINE_THRESH_DEFAULT;
+    g.view_zoom = 1.0;
+    g.view_cx = g.view_cy = 0.5;
+    double cli_mag = 1.0, cli_cx = 0.5, cli_cy = 0.5;
     g.blur = 0.0f;              /* off until asked for; B turns it on */
     g.game_blur = 1.0f;
 
@@ -2559,6 +2784,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!wcscmp(argv[i], L"-L")) g.levels = 0;
         else if (!wcscmp(argv[i], L"-av") && i + 1 < argc) g.av_offset = _wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-blur") && i + 1 < argc) g.blur = (float)_wtof(argv[++i]);
+        else if (!wcscmp(argv[i], L"-mag") && i + 1 < argc) cli_mag = _wtof(argv[++i]);
+        else if (!wcscmp(argv[i], L"-at") && i + 1 < argc) {
+            /* "-at 0.3,0.7": where to magnify, as a fraction of the frame. */
+            const wchar_t *a = argv[++i];
+            const wchar_t *comma = wcschr(a, L',');
+            cli_cx = _wtof(a);
+            if (comma) cli_cy = _wtof(comma + 1);
+        }
         else if (!wcscmp(argv[i], L"-lt") && i + 1 < argc) g.line_thresh = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-mono")) g.mono = 1;
         else if (!wcscmp(argv[i], L"-inv")) g.invert = 1;
@@ -2611,6 +2844,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         }
 
         if (!open_media(infile, 0)) return 2;
+        apply_cli_view(cli_mag, cli_cx, cli_cy);
 
         if (playtest > 0) {
             /* Run the real pacing path with no window, so the frame timing
@@ -2725,6 +2959,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
                                 L"ffmpeg and ffprobe must be on PATH.",
                         L"asciiapp", MB_OK | MB_ICONWARNING);
     }
+    apply_cli_view(cli_mag, cli_cx, cli_cy);
     LocalFree(argv);
 
     ShowWindow(g.hwnd, show);

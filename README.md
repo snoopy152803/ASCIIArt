@@ -24,6 +24,8 @@ Press **H** in the app for the key list. In short:
 | key | |
 |---|---|
 | `+` `-` or wheel | zoom, 2–600 px cells |
+| `Ctrl` + any of those | magnify: same cell count, less picture |
+| `Ctrl`+arrows or drag | move the magnified view (`Ctrl+0` resets it) |
 | `M` | mode: ascii / line art / braille / blocks / original |
 | `←` `→` | previous / next picture in the folder |
 | `C` / `I` | colour or mono / invert |
@@ -82,6 +84,37 @@ The same applies to a file that cannot be decoded at all — an `.m4a`, say,
 which has no picture in it. Opening one now reports the error and leaves what
 you were looking at exactly as it was, down to the pixel, instead of clearing
 the window behind the message box.
+
+**Zoom and magnify are different axes.** `+` / `-` change the size of a cell,
+and the number of cells is the window divided by that, so zooming in makes
+the picture *coarser* rather than closer — the framing never changes. Holding
+`Ctrl` switches the same keys and the same wheel to a magnifier: the cell
+grid is left exactly as it is and the renderer is pointed at part of the
+frame instead of all of it. Every cell then has fewer source pixels to
+average, so detail goes up rather than down.
+
+![zoom versus magnify](docs/magnify.png)
+
+At a 560×380 window with 10 px cells that is 112×32 cells either way. Zoomed
+to 30 px cells it is 37×10 for the same framing; magnified ×4 it is still
+112×32, now spread over a sixteenth of the picture — 9 source pixels per cell
+instead of 146.
+
+The view is held as a centre and a factor rather than a pixel rectangle, so
+it survives a resize, a mode change and the next video frame. Both sides are
+divided by the same factor, which means the crop keeps the frame's aspect and
+the geometry below it needs no special case — a circle still measures
+1.0000 round at ×6. It is clamped to the frame, so pushing the centre past an
+edge slides along it instead of reading off the end. `Ctrl`+arrows move by
+15% of the visible width however far in you are, a drag moves the picture
+with the pointer, and `Ctrl+0` goes back out.
+
+Because the magnifier only changes where the renderer reads, magnifying ×N is
+the same thing as having cropped the source to 1/N first. That is testable,
+and it is exact: against a frame cropped from the app's own decode output,
+the magnified render is pixel-identical in ascii, braille, blocks and
+original, at ×2, ×4 and ×8. Render cost is unchanged (13.1 → 13.4 ms at
+1920×1080), and video still plays at 1.01× real time magnified ×4.
 
 **Monochrome** (`C`) uses each cell's own grey level, not white. In ascii and
 braille either would look the same, because the glyph carries the brightness
@@ -179,6 +212,7 @@ Offscreen rendering is not limited by the screen at all:
 asciiapp.exe in.png -o out.bmp -W 3840 -H 2160 -c 4     # 720x270 cells
 asciiapp.exe in.png -o out.bmp -W 1600 -H 1200 -c 16 -m block
 asciiapp.exe in.png -o bench.txt -W 1920 -H 1080 -c 12 -bench 25
+asciiapp.exe in.png -o out.bmp -W 1600 -H 1200 -mag 4 -at 0.66,0.3
 ```
 
 Render cost at a 1920×1080 canvas:

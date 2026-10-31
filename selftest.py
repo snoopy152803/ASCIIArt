@@ -256,6 +256,64 @@ def test_video():
               summary or (r.stderr or "").strip()[:80])
 
 
+def test_app_runs():
+    """Every option combination the app offers, rendered to a file.
+
+    This exists because the desktop app once shipped a title line with one
+    argument fewer than its format string had conversions. Nothing caught
+    it: the title is only formatted when there is a window, and every check
+    here renders offscreen. The offscreen path now draws the title and the
+    key list as well, so running it is enough to catch that whole class of
+    fault - a crash shows up as a non-zero exit.
+    """
+    app = os.path.join(HERE, "asciiapp.exe")
+    if not os.path.exists(app):
+        check("app smoke test", True, "asciiapp.exe not built, skipped")
+        return
+
+    still = os.path.join(SAMPLES, "photo.jpg")
+    video = os.path.join(SAMPLES, "clip.mp4")
+    gif = os.path.join(SAMPLES, "anim.gif")
+    bmp = os.path.join(OUT, "app_smoke.bmp")
+    txt = os.path.join(OUT, "app_smoke.txt")
+
+    app_modes = ["ascii", "lines", "braille", "block", "original"]
+    options = [[], ["-mono"], ["-inv"], ["-L"], ["-blur", "0.4"],
+               ["-mag", "3"], ["-mag", "6", "-at", "0.2,0.8"], ["-g"],
+               ["-overlay"],
+               ["-mono", "-inv", "-L", "-blur", "0.3", "-mag", "2", "-overlay"]]
+
+    runs, bad = 0, []
+    for src in (still, video, gif):
+        for mode in app_modes:
+            for opts in options:
+                r = subprocess.run(
+                    [app, src, "-o", bmp, "-W", "700", "-H", "500",
+                     "-c", "11", "-m", mode] + opts, capture_output=True)
+                runs += 1
+                if r.returncode != 0:
+                    bad.append(f"{os.path.basename(src)} {mode} "
+                               f"{' '.join(opts)} -> {r.returncode}")
+
+    for opts in (["-bench", "3"], ["-playtest", "2"], ["-seektest", "1"]):
+        for src in (video, gif):
+            r = subprocess.run([app, src, "-o", txt, "-W", "700", "-H", "500",
+                                "-c", "11"] + opts, capture_output=True)
+            runs += 1
+            if r.returncode != 0:
+                bad.append(f"{os.path.basename(src)} {opts[0]} -> {r.returncode}")
+
+    r = subprocess.run([app, "-splash", "-o", bmp, "-W", "700", "-H", "500"],
+                       capture_output=True)
+    runs += 1
+    if r.returncode != 0:
+        bad.append(f"-splash -> {r.returncode}")
+
+    check("app smoke test", not bad,
+          f"{runs} offscreen runs, {len(bad)} crashed" +
+          ("  " + "; ".join(bad[:3]) if bad else ""))
+
+
 def main():
     print(f"python {sys.version.split()[0]}  numpy {np.__version__}")
     test_geometry()
@@ -266,6 +324,7 @@ def main():
     test_tone()
     test_images()
     test_video()
+    test_app_runs()
     print(f"\n{passed} passed, {failed} failed")
     return 1 if failed else 0
 

@@ -213,7 +213,18 @@ asciiapp.exe in.png -o out.bmp -W 3840 -H 2160 -c 4     # 720x270 cells
 asciiapp.exe in.png -o out.bmp -W 1600 -H 1200 -c 16 -m block
 asciiapp.exe in.png -o bench.txt -W 1920 -H 1080 -c 12 -bench 25
 asciiapp.exe in.png -o out.bmp -W 1600 -H 1200 -mag 4 -at 0.66,0.3
+asciiapp.exe in.png -o out.bmp -W 1600 -H 1200 -overlay    # with the key list
 ```
+
+An offscreen render draws the title line and, with `-overlay`, the key list,
+even though there is no window to put them on. That is deliberate. Those two
+were the only things the app drew that a file render never touched, and a
+title line went out with one argument fewer than its format string had
+conversions — so `_snwprintf` read a float as a string pointer and the window
+died a few seconds after opening any picture. Every offscreen check passed,
+because none of them ever formatted the title. `selftest.py` now runs the app
+across 157 combinations of file, mode and option; on the faulty build 156 of
+them crash.
 
 Render cost at a 1920×1080 canvas:
 

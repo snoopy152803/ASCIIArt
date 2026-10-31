@@ -2157,11 +2157,11 @@ static void update_title(void)
                    g.mono ? L"mono" : L"colour",
                    g.invert ? L" - inverted" : L"",
                    g.levels ? L" - auto-levels" : L"",
-                   blurtxt,
+                   blurtxt, magtxt,
                    g.out_gamma, extra,
                    g.slideshow ? L" - slideshow" : L"");
     }
-    SetWindowTextW(g.hwnd, g.status);
+    if (g.hwnd) SetWindowTextW(g.hwnd, g.status);
 }
 
 /* Shown when nothing is loaded. The app used to throw a file dialog at you
@@ -2329,11 +2329,14 @@ static void draw_help(HDC dc)
     /* Measured, not guessed: the list has grown over the life of the app
        and a fixed 430 px silently clipped the longest lines. */
     int wmax = 0;
+    SIZE sz;
+    if (GetTextExtentPoint32W(dc, g.status, (int)wcslen(g.status), &sz))
+        wmax = sz.cx;          /* the status line is drawn in here too */
     for (int i = 0; i < n; i++) {
-        SIZE sz;
         if (GetTextExtentPoint32W(dc, lines[i], (int)wcslen(lines[i]), &sz) &&
             sz.cx > wmax) wmax = sz.cx;
     }
+    if (wmax > g.dib_w - 64) wmax = g.dib_w - 64;       /* stay on screen */
     RECT box = { 20, 20, 20 + wmax + 24, 20 + 22 * (n + 1) + 10 };
     HBRUSH bg = CreateSolidBrush(RGB(16, 16, 20));
     FillRect(dc, &box, bg);
@@ -2712,6 +2715,22 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* The title and the key list are the only things the window draws that a
+   file render never did, which is exactly how a title line with one
+   argument too few got shipped: every offscreen check passed because none
+   of them ever formatted it. They are drawn here too now. */
+static void draw_overlays_offscreen(int want_help)
+{
+    update_title();
+    if (!want_help || !g.dib) return;
+    HDC dc = CreateCompatibleDC(NULL);
+    HGDIOBJ old = SelectObject(dc, g.dib);
+    draw_help(dc);
+    GdiFlush();
+    SelectObject(dc, old);
+    DeleteDC(dc);
+}
+
 /* -------------------------------------------------------------------- main */
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
@@ -2778,6 +2797,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!wcscmp(argv[i], L"-playtest") && i + 1 < argc) i++;
         else if (!wcscmp(argv[i], L"-seektest") && i + 1 < argc) i++;
         else if (!wcscmp(argv[i], L"-badopen") && i + 1 < argc) i++;
+        else if (!wcscmp(argv[i], L"-overlay")) { }   /* read below */
         else if (!wcscmp(argv[i], L"-w") && i + 1 < argc) g.whiten = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-g") && i + 1 < argc) g.out_gamma = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-splash")) { }   /* read below */
@@ -2813,7 +2833,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     build_bank();
     resize_dib(g.hwnd);
 
-    int bench = 0, splash = 0, seektest = 0;
+    int bench = 0, splash = 0, seektest = 0, overlay = 0;
     double playtest = 0, seekto = 0;
     const wchar_t *badopen = NULL;
     for (int i = 1; i < argc; i++) {
@@ -2825,6 +2845,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         }
         if (!wcscmp(argv[i], L"-badopen") && i + 1 < argc) badopen = argv[i + 1];
         if (!wcscmp(argv[i], L"-splash")) splash = 1;
+        if (!wcscmp(argv[i], L"-overlay")) overlay = 1;
     }
 
     if (out && (infile || splash)) {
@@ -2857,7 +2878,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
                 QueryPerformanceCounter(&now);
                 double el = (double)(now.QuadPart - t0.QuadPart) / g.qpf.QuadPart;
                 if (el >= playtest) break;
-                if (pump_video() > 0) { render(); drawn++; }
+                if (pump_video() > 0) { render(); draw_overlays_offscreen(0); drawn++; }
                 else Sleep(1);
             }
             QueryPerformanceCounter(&now);
@@ -2902,6 +2923,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
                 if (el > 5000) break;
                 Sleep(1);
             }
+            draw_overlays_offscreen(0);
             QueryPerformanceCounter(&now);
             double gap = 1000.0 * (now.QuadPart - t0.QuadPart) / g.qpf.QuadPart;
             FILE *f = _wfopen(out, L"w");
@@ -2923,6 +2945,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
             /* Time the renderer itself. Process startup and ffmpeg dwarf a
                single frame, so measuring from outside tells you nothing. */
             render();                                   /* warm the atlas */
+            draw_overlays_offscreen(0);                 /* and the title */
             LARGE_INTEGER freq, t0, t1;
             QueryPerformanceFrequency(&freq);
             QueryPerformanceCounter(&t0);
@@ -2932,9 +2955,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
             FILE *f = _wfopen(out, L"w");
             if (f) {
                 fprintf(f, "%dx%d canvas, %dpx cells, %dx%d cells, %ls\n"
-                           "%.2f ms/frame\n%.1f fps\n",
+                           "%.2f ms/frame\n%.1f fps\n%ls\n",
                         g.dib_w, g.dib_h, g.cell_h, g.cols, g.rows, mode_name(),
-                        ms, 1000.0 / ms);
+                        ms, 1000.0 / ms, g.status);
                 fclose(f);
             }
             LocalFree(argv);
@@ -2943,6 +2966,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         }
 
         render();
+        draw_overlays_offscreen(overlay);
         int ok = write_bmp(out);
         LocalFree(argv);
         close_media();

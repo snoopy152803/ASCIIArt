@@ -277,7 +277,7 @@ def test_app_runs():
     bmp = os.path.join(OUT, "app_smoke.bmp")
     txt = os.path.join(OUT, "app_smoke.txt")
 
-    app_modes = ["ascii", "lines", "braille", "block", "original"]
+    app_modes = ["ascii", "lines", "outline", "braille", "block", "original"]
     options = [[], ["-mono"], ["-inv"], ["-L"], ["-blur", "0.4"],
                ["-mag", "3"], ["-mag", "6", "-at", "0.2,0.8"], ["-g"],
                ["-overlay"],

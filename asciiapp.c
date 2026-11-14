@@ -15,7 +15,7 @@
  *
  * Media is decoded by ffmpeg (must be on PATH), read as raw RGB over a pipe.
  *
- * Keys:  + -  zoom (or wheel)        M  mode: ascii / braille / blocks
+ * Keys:  + -  zoom (or wheel)        M  mode: ascii / lines / outline / ...
  *        Ctrl + zoom  magnify       Ctrl+arrows / drag  move the view
  *        F    fullscreen             L  auto-levels on/off
  *        Space pause                 ,  .  seek -/+ 5s
@@ -49,10 +49,14 @@
 
 #define MODE_ASCII 0
 #define MODE_LINES 1
-#define MODE_BRAILLE 2
-#define MODE_BLOCK 3
-#define MODE_ORIGINAL 4            /* the picture itself, no characters */
-#define MODE_COUNT 5
+#define MODE_OUTLINE 2             /* one contour line, like a quick sketch */
+#define MODE_BRAILLE 3
+#define MODE_BLOCK 4
+#define MODE_ORIGINAL 5            /* the picture itself, no characters */
+#define MODE_COUNT 6
+
+#define OUTLINE_LEVELS_DEFAULT 2   /* regions: 2 = subject and background */
+#define OUTLINE_INK 0x00e8e8e8
 
 /* Blur is not a mode: it is a filter on the source frame, so it composes
    with whichever mode is drawing. Strength is a fraction of the decoded
@@ -168,6 +172,12 @@ typedef struct {
     int slideshow;
     double av_offset;                   /* audio lead, seconds */
     float line_thresh;                  /* line art: ink this much edge */
+    int outline_levels;                 /* outline: tone regions, 2..6 */
+    float *orgb;                        /* outline: smoothed colour, 3/sample */
+    unsigned char *olab;                /* outline: region of each sample */
+    int *ocell;                         /* outline: glyph per cell, 0 = none */
+    int *ostack;                        /* outline: flood-fill work list */
+    int oscratch_sub, oscratch_cells;
     float blur;                         /* display blur, 0..1 */
     int game_blur_mode;                 /* game reveals focus, not cells */
     float game_blur;                    /* the game's current blur */
@@ -190,6 +200,7 @@ static App g;
 /* ------------------------------------------------------------- small utils */
 
 static int imax(int a, int b) { return a > b ? a : b; }
+static int imin(int a, int b) { return a < b ? a : b; }
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -1341,6 +1352,312 @@ typedef struct {
     int cols, rows, cw, ch, ox, oy, stride, sub_w, sub_h, shape;
 } RowJob;
 
+/* ----------------------------------------------------------------- outline
+ *
+ * Line art inks every edge, so a photograph comes out as dense hatching:
+ * bark, grass, each leaf. A person sketching an outline does something much
+ * cruder - they find the big shapes and draw round them once. This does
+ * the same:
+ *
+ *   1. blur hard, so texture is gone and only large shapes survive;
+ *   2. split it into a few regions of similar colour (2 by default) with
+ *      k-means - colour, not just brightness, or a red ball on a blue sky
+ *      of the same brightness would have no outline at all;
+ *   3. ink only the cells a region boundary passes through;
+ *   4. throw away short pieces, so what is left is a few long strokes.
+ *
+ * The glyph for each cell comes from the direction of the boundary there,
+ * so the outline is drawn with - _ | / \ like a hand-made one. */
+
+static void box_blur_f(float *a, float *tmp, int w, int h, int r)
+{
+    float inv = 1.0f / (2 * r + 1);
+    for (int y = 0; y < h; y++) {
+        const float *row = a + (size_t)y * w;
+        float *o = tmp + (size_t)y * w;
+        float sum = 0;
+        for (int i = -r; i <= r; i++) sum += row[clampi(i, 0, w - 1)];
+        for (int x = 0; x < w; x++) {
+            o[x] = sum * inv;
+            sum += row[clampi(x + r + 1, 0, w - 1)] - row[clampi(x - r, 0, w - 1)];
+        }
+    }
+    for (int x = 0; x < w; x++) {
+        float sum = 0;
+        for (int i = -r; i <= r; i++) sum += tmp[(size_t)clampi(i, 0, h - 1) * w + x];
+        for (int y = 0; y < h; y++) {
+            a[(size_t)y * w + x] = sum * inv;
+            sum += tmp[(size_t)clampi(y + r + 1, 0, h - 1) * w + x]
+                 - tmp[(size_t)clampi(y - r, 0, h - 1) * w + x];
+        }
+    }
+}
+
+static int outline_alloc(int sub_n, int cells)
+{
+    if (sub_n > g.oscratch_sub) {
+        free(g.olab); free(g.orgb);
+        g.olab = (unsigned char *)malloc((size_t)sub_n);
+        g.orgb = (float *)malloc((size_t)sub_n * 3 * sizeof(float));
+        g.oscratch_sub = sub_n;
+    }
+    if (cells > g.oscratch_cells) {
+        free(g.ocell); free(g.ostack);
+        g.ocell = (int *)malloc((size_t)cells * sizeof(int));
+        g.ostack = (int *)malloc((size_t)cells * sizeof(int));
+        g.oscratch_cells = cells;
+    }
+    return g.olab && g.orgb && g.ocell && g.ostack;
+}
+
+typedef struct {
+    int sub_w, sub_h, cols, rows, f, cw_, ch_, k;
+    const float *crgb;
+    float cen[6][3];
+} OutlineCtx;
+
+/* Interpolate the smoothed colour back up to sample resolution and label
+   every sample by its nearest region centre. */
+static void outline_label_band(void *vctx, int yy0, int yy1)
+{
+    const OutlineCtx *c = (const OutlineCtx *)vctx;
+    int sub_w = c->sub_w, f = c->f, cw_ = c->cw_, ch_ = c->ch_, k = c->k;
+    const float *crgb = c->crgb;
+    for (int y = yy0; y < yy1; y++) {
+        float fy = (y + 0.5f) / f - 0.5f;
+        int y0 = clampi((int)floorf(fy), 0, ch_ - 1), y1 = imin(y0 + 1, ch_ - 1);
+        float ty = clampf(fy - y0, 0.0f, 1.0f);
+        for (int x = 0; x < sub_w; x++) {
+            float fx = (x + 0.5f) / f - 0.5f;
+            int x0 = clampi((int)floorf(fx), 0, cw_ - 1), x1 = imin(x0 + 1, cw_ - 1);
+            float tx = clampf(fx - x0, 0.0f, 1.0f);
+            const float *p00 = crgb + ((size_t)y0 * cw_ + x0) * 3;
+            const float *p01 = crgb + ((size_t)y0 * cw_ + x1) * 3;
+            const float *p10 = crgb + ((size_t)y1 * cw_ + x0) * 3;
+            const float *p11 = crgb + ((size_t)y1 * cw_ + x1) * 3;
+            float *o = g.orgb + ((size_t)y * sub_w + x) * 3;
+            for (int ch = 0; ch < 3; ch++) {
+                float top = p00[ch] + (p01[ch] - p00[ch]) * tx;
+                float bot = p10[ch] + (p11[ch] - p10[ch]) * tx;
+                o[ch] = top + (bot - top) * ty;
+            }
+            int bq = 0;
+            float bd = 1e9f;
+            for (int q = 0; q < k; q++) {
+                float d0 = o[0] - c->cen[q][0], d1 = o[1] - c->cen[q][1];
+                float d2 = o[2] - c->cen[q][2];
+                float d = d0 * d0 + d1 * d1 + d2 * d2;
+                if (d < bd) { bd = d; bq = q; }
+            }
+            g.olab[(size_t)y * sub_w + x] = (unsigned char)bq;
+        }
+    }
+}
+
+/* Pick a glyph for every cell a region boundary passes through. A step
+   between two samples belongs to the cell holding the left/upper one, so
+   each is counted once and bands never write the same cell. */
+static void outline_cell_band(void *vctx, int row0, int row1)
+{
+    const OutlineCtx *c = (const OutlineCtx *)vctx;
+    int sub_w = c->sub_w, sub_h = c->sub_h, cols = c->cols;
+    const float (*cen)[3] = c->cen;
+    static const int BIN_CH[4] = { L'-', L'\\', L'|', L'/' };
+    for (int cy = row0; cy < row1; cy++) {
+        for (int cx = 0; cx < cols; cx++) {
+            float bins[4] = { 0, 0, 0, 0 };
+            float wy = 0, wsum = 0;
+            for (int sy = 0; sy < GH; sy++) {
+                int py = cy * GH + sy;
+                for (int sx = 0; sx < GW; sx++) {
+                    int px = cx * GW + sx;
+                    unsigned char here = g.olab[(size_t)py * sub_w + px];
+                    int right = px + 1 < sub_w && g.olab[(size_t)py * sub_w + px + 1] != here;
+                    int down = py + 1 < sub_h && g.olab[(size_t)(py + 1) * sub_w + px] != here;
+                    if (!right && !down) continue;
+                    /* Boundary direction: the gradient of the smoothed colour
+                       along the line joining the two regions' centres. Not
+                       brightness, which is flat across exactly the colour
+                       edges this mode exists to catch. */
+                    int other = right ? g.olab[(size_t)py * sub_w + px + 1]
+                                      : g.olab[(size_t)(py + 1) * sub_w + px];
+                    float d0 = cen[here][0] - cen[other][0];
+                    float d1 = cen[here][1] - cen[other][1];
+                    float d2 = cen[here][2] - cen[other][2];
+                    int xm = px > 0 ? px - 1 : px, xp = px + 1 < sub_w ? px + 1 : px;
+                    int ym = py > 0 ? py - 1 : py, yp = py + 1 < sub_h ? py + 1 : py;
+#define PROJ(X, Y) (g.orgb[((size_t)(Y) * sub_w + (X)) * 3] * d0 + \
+                    g.orgb[((size_t)(Y) * sub_w + (X)) * 3 + 1] * d1 + \
+                    g.orgb[((size_t)(Y) * sub_w + (X)) * 3 + 2] * d2)
+                    float gx = PROJ(xp, py) - PROJ(xm, py);
+                    float gy = PROJ(px, yp) - PROJ(px, ym);
+#undef PROJ
+                    /* the sample grid is GW x GH per 1:2 cell, so a sample
+                       step is twice as tall as it is wide on screen */
+                    gy *= (float)GW / GH * 2.0f;
+                    float m = sqrtf(gx * gx + gy * gy) + 1e-6f;
+                    float ang = atan2f(gx, -gy);
+                    if (ang < 0) ang += 3.14159265f;
+                    int b = (int)((ang + 0.39269908f) / 0.78539816f) & 3;
+                    bins[b] += m;
+                    wy += m * (sy + (down ? 1.0f : 0.5f));
+                    wsum += m;
+                }
+            }
+            int cp = 0;
+            if (wsum > 0) {
+                int best = 0;
+                for (int b = 1; b < 4; b++) if (bins[b] > bins[best]) best = b;
+                cp = BIN_CH[best];
+                if (best == 0) cp = (wy / wsum / GH > 0.6f) ? L'_' : L'-';
+            }
+            g.ocell[cy * cols + cx] = cp;
+        }
+    }
+
+}
+
+static void build_outline(int cols, int rows, int sub_w, int sub_h)
+{
+    int n = sub_w * sub_h, cells = cols * rows;
+    if (!outline_alloc(n, cells)) return;
+
+    /* The regions are heavily smoothed, so there is nothing to gain from
+       finding them at full sample resolution - doing so cost over half a
+       second a frame at 1080p. They are fitted on a grid of at most ~240
+       samples across, and the smoothed colour is then interpolated back up
+       so the boundaries still land between samples, not between blocks. */
+    int f = imax(1, ((sub_w > sub_h ? sub_w : sub_h) + 239) / 240);
+    int cw_ = (sub_w + f - 1) / f, ch_ = (sub_h + f - 1) / f, cn = cw_ * ch_;
+    float *crgb = (float *)malloc((size_t)cn * 3 * sizeof(float));
+    float *cone = (float *)malloc((size_t)cn * sizeof(float));
+    float *ctmp = (float *)malloc((size_t)cn * sizeof(float));
+    if (!crgb || !cone || !ctmp) { free(crgb); free(cone); free(ctmp); return; }
+
+    /* 1. Colour on the small grid, as luminance plus two opponent axes
+          (red-green, yellow-blue) so k-means compares hues sensibly. */
+    {
+        const unsigned char *src = active_frame();
+        int sw = g.dec_w;
+        SrcRect v = g.view;
+        for (int y = 0; y < ch_; y++) {
+            int y0 = v.y + y * v.h / ch_, y1 = v.y + (y + 1) * v.h / ch_;
+            if (y1 <= y0) y1 = y0 + 1;
+            for (int x = 0; x < cw_; x++) {
+                int x0 = v.x + x * v.w / cw_, x1 = v.x + (x + 1) * v.w / cw_;
+                if (x1 <= x0) x1 = x0 + 1;
+                unsigned int r = 0, gg = 0, bb = 0, cnt = 0;
+                for (int yy = y0; yy < y1; yy++) {
+                    const unsigned char *row = src + (size_t)yy * sw * 3;
+                    for (int xx = x0; xx < x1; xx++) {
+                        r += row[xx * 3]; gg += row[xx * 3 + 1]; bb += row[xx * 3 + 2];
+                        cnt++;
+                    }
+                }
+                float inv = 1.0f / (255.0f * (cnt ? cnt : 1));
+                float R = r * inv, G = gg * inv, B = bb * inv;
+                float *o = crgb + ((size_t)y * cw_ + x) * 3;
+                o[0] = 0.2126f * R + 0.7152f * G + 0.0722f * B;
+                o[1] = (R - G) * 1.5f;
+                o[2] = ((R + G) * 0.5f - B) * 1.5f;
+            }
+        }
+    }
+
+    /* 2. Smooth hard, so only big shapes survive. Three box passes make a
+          near-Gaussian; the radius is a fraction of the picture, not of a
+          cell, so the same picture outlines the same way at any zoom. */
+    int r = imax(1, (int)((cw_ > ch_ ? cw_ : ch_) * 0.035f + 0.5f));
+    for (int c = 0; c < 3; c++) {
+        for (int i = 0; i < cn; i++) cone[i] = crgb[(size_t)i * 3 + c];
+        for (int pass = 0; pass < 3; pass++) box_blur_f(cone, ctmp, cw_, ch_, r);
+        for (int i = 0; i < cn; i++) crgb[(size_t)i * 3 + c] = cone[i];
+    }
+
+    /* 3. Regions: k-means on those colours, seeded by brightness. */
+    int k = clampi(g.outline_levels, 2, 6);
+    float cen[6][3];
+    {
+        int hist[256] = { 0 };
+        for (int i = 0; i < cn; i++)
+            hist[clampi((int)(crgb[(size_t)i * 3] * 255.0f), 0, 255)]++;
+        for (int q = 0; q < k; q++) {
+            int want = (int)((q + 0.5) * cn / k), acc = 0, bin = 0;
+            while (bin < 255 && acc + hist[bin] <= want) acc += hist[bin++];
+            /* the seed is a real sample of about that brightness */
+            float best = 1e9f;
+            cen[q][0] = bin / 255.0f; cen[q][1] = cen[q][2] = 0;
+            for (int i = 0; i < cn; i++) {
+                float d = fabsf(crgb[(size_t)i * 3] - bin / 255.0f);
+                if (d < best) {
+                    best = d;
+                    cen[q][1] = crgb[(size_t)i * 3 + 1];
+                    cen[q][2] = crgb[(size_t)i * 3 + 2];
+                }
+            }
+        }
+        for (int it = 0; it < 20; it++) {
+            double sum[6][3] = { { 0 } }, cnt[6] = { 0 };
+            for (int i = 0; i < cn; i++) {
+                const float *o = crgb + (size_t)i * 3;
+                int bq = 0;
+                float bd = 1e9f;
+                for (int q = 0; q < k; q++) {
+                    float d0 = o[0] - cen[q][0], d1 = o[1] - cen[q][1], d2 = o[2] - cen[q][2];
+                    float d = d0 * d0 + d1 * d1 + d2 * d2;
+                    if (d < bd) { bd = d; bq = q; }
+                }
+                sum[bq][0] += o[0]; sum[bq][1] += o[1]; sum[bq][2] += o[2];
+                cnt[bq] += 1;
+            }
+            for (int q = 0; q < k; q++)
+                if (cnt[q] > 0)
+                    for (int c = 0; c < 3; c++) cen[q][c] = (float)(sum[q][c] / cnt[q]);
+        }
+    }
+
+    /* Back up to full sample resolution: interpolate the smoothed colour,
+       then label every sample by its nearest centre. */
+    OutlineCtx oc = { sub_w, sub_h, cols, rows, f, cw_, ch_, k, crgb };
+    memcpy(oc.cen, cen, sizeof cen);
+    parallel_rows(outline_label_band, &oc, 0, sub_h);
+    free(crgb); free(cone); free(ctmp);
+
+    /* 4. Cells a boundary crosses. */
+    parallel_rows(outline_cell_band, &oc, 0, rows);
+
+    /* 5. Drop short pieces: a connected run of fewer than this many cells
+          is a speck or a texture fragment, not part of an outline. */
+    int minlen = imax(4, (cols + rows) / 18);
+    for (int i = 0; i < cells; i++) {
+        if (g.ocell[i] <= 0) continue;
+        /* flood-fill the piece, marking visited cells negative */
+        int top = 0, count = 0;
+        g.ostack[top++] = i;
+        g.ocell[i] = -g.ocell[i];
+        int first = 0;
+        while (first < top) {
+            int c = g.ostack[first++];
+            count++;
+            int x = c % cols, y = c / cols;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int nx = x + dx, ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+                    int nc = ny * cols + nx;
+                    if (g.ocell[nc] > 0) {
+                        g.ocell[nc] = -g.ocell[nc];
+                        g.ostack[top++] = nc;
+                    }
+                }
+        }
+        /* the work list holds exactly this piece: keep it or clear it */
+        for (int q = 0; q < top; q++)
+            g.ocell[g.ostack[q]] = count >= minlen ? g.ocell[g.ostack[q]] : 0;
+    }
+    for (int i = 0; i < cells; i++) if (g.ocell[i] < 0) g.ocell[i] = -g.ocell[i];
+}
+
 static void render_rows(const RowJob *j)
 {
     int cols = j->cols, cw = j->cw, ch = j->ch;
@@ -1363,6 +1680,19 @@ static void render_rows(const RowJob *j)
                 }
             }
         }
+        return;
+    }
+
+    if (g.mode == MODE_OUTLINE) {
+        /* One ink, no shading: this is a drawing, not a picture. */
+        for (int y = j->y0; y < j->y1; y++)
+            for (int x = 0; x < cols; x++) {
+                int cp = g.ocell[(size_t)y * cols + x];
+                int gi = cp - FIRST_CH;
+                if (cp <= 0 || gi < 0 || gi >= NGLYPH) continue;
+                blit_glyph(g.atlas, gi, ox + x * cw, oy + y * ch, cw, ch,
+                           OUTLINE_INK, stride);
+            }
         return;
     }
 
@@ -1713,7 +2043,9 @@ static void render(void)
 
     int shape = (g.mode == MODE_ASCII) && (ch >= SHAPE_MIN_CELL);
     int sub_w = cols, sub_h = rows;
-    if (shape || g.mode == MODE_LINES) { sub_w = cols * GW;  sub_h = rows * GH;  }
+    if (shape || g.mode == MODE_LINES || g.mode == MODE_OUTLINE) {
+        sub_w = cols * GW;  sub_h = rows * GH;
+    }
     else if (g.mode == MODE_BRAILLE)   { sub_w = cols * BRW; sub_h = rows * BRH; }
 
     size_t need_sub = (size_t)sub_w * sub_h;
@@ -1761,7 +2093,9 @@ static void render(void)
         return;
     }
 
-    resample(sub_w, sub_h, cols, rows);
+    /* Outline reads the frame itself and draws in a single ink, so the
+       luminance and cell colours would be computed for nothing. */
+    if (g.mode != MODE_OUTLINE) resample(sub_w, sub_h, cols, rows);
     build_atlas(cw, ch);
     /* Both atlases must be built before the bands start: they are shared,
        and a worker rebuilding one while another reads it corrupts the frame. */
@@ -1769,6 +2103,10 @@ static void render(void)
     if (g.mode == MODE_LINES) {
         BlurCtx bc = { sub_w, sub_h };
         parallel_rows(blur_band, &bc, 0, sub_h);
+    }
+    if (g.mode == MODE_OUTLINE) {
+        build_outline(cols, rows, sub_w, sub_h);
+        if (!g.ocell) return;
     }
 
     parallel_rows(clear_band, NULL, 0, g.dib_h);
@@ -1913,6 +2251,7 @@ static const wchar_t *mode_name(void)
     if (g.mode == MODE_BLOCK) return L"blocks";
     if (g.mode == MODE_BRAILLE) return L"braille";
     if (g.mode == MODE_LINES) return L"line art";
+    if (g.mode == MODE_OUTLINE) return L"outline";
     if (g.mode == MODE_ORIGINAL) return L"original";
     return g.cell_h >= SHAPE_MIN_CELL ? L"ascii (shape)" : L"ascii (tone)";
 }
@@ -2281,10 +2620,11 @@ static void draw_help(HDC dc)
     static const wchar_t *normal_lines[] = {
         L"  + / -  or wheel    zoom  (bigger cells, so fewer of them)",
         L"  Ctrl + zoom        magnify: same cells, closer in",
-        L"  M                  mode: ascii / line art / braille /",
-        L"                     blocks / original",
+        L"  M                  mode: ascii / line art / outline /",
+        L"                     braille / blocks / original",
         L"  B                  blur on / off   { } less / more",
-        L"  [  ]               midtones  (line art: edge threshold)",
+        L"  [  ]               midtones  (line art: edge threshold,",
+        L"                     outline: fewer / more shapes)",
         L"  left / right       previous / next picture in the folder",
         L"  C                  colour / monochrome",
         L"  I                  invert",
@@ -2525,7 +2865,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         }
         case '[':
-            if (g.mode == MODE_LINES) {
+            if (g.mode == MODE_OUTLINE) {
+                g.outline_levels = clampi(g.outline_levels - 1, 2, 6);
+            } else if (g.mode == MODE_LINES) {
                 g.line_thresh = clampf(g.line_thresh * 0.8f, 0.005f, 1.0f);
             } else {
                 g.out_gamma = clampf(g.out_gamma + 0.06f, 0.2f, 2.0f);
@@ -2533,7 +2875,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case ']':
-            if (g.mode == MODE_LINES) {
+            if (g.mode == MODE_OUTLINE) {
+                g.outline_levels = clampi(g.outline_levels + 1, 2, 6);
+            } else if (g.mode == MODE_LINES) {
                 g.line_thresh = clampf(g.line_thresh * 1.25f, 0.005f, 1.0f);
             } else {
                 g.out_gamma = clampf(g.out_gamma - 0.06f, 0.2f, 2.0f);
@@ -2599,6 +2943,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.audio_on = 1;
             g.av_offset = AV_OFFSET_DEFAULT;
             g.line_thresh = LINE_THRESH_DEFAULT;
+            g.outline_levels = OUTLINE_LEVELS_DEFAULT;
             g.blur = 0.0f;
             g.game_blur = 1.0f;
             g.game_blur_mode = 0;
@@ -2754,6 +3099,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     g.have_ffplay = 1;   /* assumed; a missing ffplay just never starts */
     g.av_offset = AV_OFFSET_DEFAULT;
     g.line_thresh = LINE_THRESH_DEFAULT;
+    g.outline_levels = OUTLINE_LEVELS_DEFAULT;
     g.view_zoom = 1.0;
     g.view_cx = g.view_cy = 0.5;
     double cli_mag = 1.0, cli_cx = 0.5, cli_cy = 0.5;
@@ -2812,6 +3158,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
             cli_cx = _wtof(a);
             if (comma) cli_cy = _wtof(comma + 1);
         }
+        else if (!wcscmp(argv[i], L"-ol") && i + 1 < argc) g.outline_levels = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"-lt") && i + 1 < argc) g.line_thresh = (float)_wtof(argv[++i]);
         else if (!wcscmp(argv[i], L"-mono")) g.mono = 1;
         else if (!wcscmp(argv[i], L"-inv")) g.invert = 1;
@@ -2820,6 +3167,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
             g.mode = !wcscmp(m, L"block") ? MODE_BLOCK
                    : !wcscmp(m, L"braille") ? MODE_BRAILLE
                    : !wcscmp(m, L"lines") ? MODE_LINES
+                   : !wcscmp(m, L"outline") ? MODE_OUTLINE
                    : !wcscmp(m, L"original") ? MODE_ORIGINAL : MODE_ASCII;
         }
         else if (argv[i][0] != L'-') infile = argv[i];

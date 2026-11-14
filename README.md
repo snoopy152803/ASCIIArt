@@ -26,10 +26,10 @@ Press **H** in the app for the key list. In short:
 | `+` `-` or wheel | zoom, 2–600 px cells |
 | `Ctrl` + any of those | magnify: same cell count, less picture |
 | `Ctrl`+arrows or drag | move the magnified view (`Ctrl+0` resets it) |
-| `M` | mode: ascii / line art / braille / blocks / original |
+| `M` | mode: ascii / line art / outline / braille / blocks / original |
 | `←` `→` | previous / next picture in the folder |
 | `C` / `I` | colour or mono / invert |
-| `[` `]` | brighter / darker midtones (line art: edge threshold) |
+| `[` `]` | brighter / darker midtones (line art: edge threshold; outline: fewer / more shapes) |
 | `B` / `{` `}` | blur on-off / less / more |
 | `A` | mute / unmute video sound |
 | `;` `'` | nudge the audio earlier / later |
@@ -157,7 +157,8 @@ resolution and starts out of focus, with `Space` taking the blur off — about
 uncover, so there it always reveals focus.
 
 **Modes.** `ascii` matches glyph shapes to the image; `line art` draws only
-edges, using the character that matches each edge's direction; `braille` uses
+edges, using the character that matches each edge's direction; `outline` draws
+one line round the big shapes, like a quick sketch; `braille` uses
 2×4 dithered dots (drawn, not from a font — Consolas has no braille);
 `blocks` fills each cell with a solid colour; `original` is the picture
 itself, no characters at all — handy for comparing the art against its
@@ -430,6 +431,37 @@ gradient — to an "edge", and the picture fills with dashes. Smoothing first is
 the standard opening move of edge detection, and it is the single change that
 turned this from a mess into clean contours. `[` and `]` set how much edge
 energy a cell needs before it inks anything.
+
+## Outline: one line, not every edge
+
+![outline](docs/outline.png)
+
+Line art inks every edge it finds, so a photograph comes out as dense
+hatching — bark, grass, every cushion. Nobody draws like that by hand. A quick
+sketch finds the big shapes and goes round each of them once, and `outline`
+does the same:
+
+1. **Blur hard** (3.5% of the picture), so texture is gone and only large
+   shapes survive.
+2. **Split the picture into regions of similar colour** with k-means — 2 by
+   default, subject and background. Colour, not just brightness: the red ball
+   and the blue sky above it are almost the same brightness, and a
+   brightness-only version drew no outline round the ball at all.
+3. **Ink only the cells a region boundary passes through**, with `-` `_` `|`
+   `/` `\` chosen from the boundary's direction.
+4. **Drop short pieces**, so what is left is a few long strokes rather than
+   specks.
+
+It is drawn in a single ink — it is a drawing, not a picture. `[` and `]` set
+the number of regions from 2 to 6. Two gives the barest silhouette and is
+right for a single subject (the ball on its horizon above); some pictures need
+one more — the city's dark buildings share a colour with the dark sky above
+them, so only a third region separates them.
+
+The regions are fitted on a small grid (at most ~240 samples across) and the
+smoothed colour interpolated back up, since finding them at full resolution
+cost over half a second a frame and bought nothing after a blur that size. It
+runs at the same speed as line art, and faster at small cells.
 
 ## How the character mode works
 

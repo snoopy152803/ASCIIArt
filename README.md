@@ -157,8 +157,9 @@ resolution and starts out of focus, with `Space` taking the blur off — about
 uncover, so there it always reveals focus.
 
 **Modes.** `ascii` matches glyph shapes to the image; `line art` draws only
-edges, using the character that matches each edge's direction; `outline` draws
-one line round the big shapes, like a quick sketch; `braille` uses
+edges, using the character that matches each edge's direction; `outline` is
+a line drawing in text, pencil on paper, one stroke round the big shapes;
+`braille` uses
 2×4 dithered dots (drawn, not from a font — Consolas has no braille);
 `blocks` fills each cell with a solid colour; `original` is the picture
 itself, no characters at all — handy for comparing the art against its
@@ -432,36 +433,67 @@ the standard opening move of edge detection, and it is the single change that
 turned this from a mess into clean contours. `[` and `]` set how much edge
 energy a cell needs before it inks anything.
 
-## Outline: one line, not every edge
+## Outline: a line drawing in text
 
 ![outline](docs/outline.png)
 
-Line art inks every edge it finds, so a photograph comes out as dense
-hatching — bark, grass, every cushion. Nobody draws like that by hand. A quick
-sketch finds the big shapes and goes round each of them once, and `outline`
-does the same:
+This is the style of hand-made text art: thin dark strokes on paper, where
+every character is there because its *shape* continues the line — `(` and `)`
+for curves, `/` and `\` for slopes, `_` `‾` `─` for straight runs, a `^` or
+`v` or `L` where the line turns. Line art is the opposite: it inks every edge
+it finds, so a photograph turns into dense hatching nobody would draw by hand.
+
+**Finding the line.** A sketch goes round the big shapes once, so:
 
 1. **Blur hard** (3.5% of the picture), so texture is gone and only large
    shapes survive.
 2. **Split the picture into regions of similar colour** with k-means — 2 by
-   default, subject and background. Colour, not just brightness: the red ball
-   and the blue sky above it are almost the same brightness, and a
-   brightness-only version drew no outline round the ball at all.
-3. **Ink only the cells a region boundary passes through**, with `-` `_` `|`
-   `/` `\` chosen from the boundary's direction.
-4. **Drop short pieces**, so what is left is a few long strokes rather than
-   specks.
+   default, subject and background. Colour, not brightness: the red ball and
+   the blue sky above it are almost the same brightness, and a brightness-only
+   version drew no outline round the ball at all.
+3. **Draw the region boundaries as a line one sample thick**, on a grid of
+   8×16 samples per cell.
+4. **Drop short pieces**, so what is left is a few long strokes, not specks.
 
-It is drawn in a single ink — it is a drawing, not a picture. `[` and `]` set
-the number of regions from 2 to 6. Two gives the barest silhouette and is
-right for a single subject (the ball on its horizon above); some pictures need
-one more — the city's dark buildings share a colour with the dark sky above
-them, so only a third region separates them.
+**Choosing the characters.** Each cell gets the character whose shape best
+fits the piece of line inside it, by chamfer matching: the cost is how far the
+glyph's ink lies from the line, plus how far the line lies from the ink. The
+first term punishes a stray stroke in proportion to how far it strays, so a
+letter with an extra arm loses to a plain bracket; the second punishes leaving
+part of the line undrawn. Distances rather than pixel overlap are what let a
+line sitting a little off-centre still match `|`. Plain pixel difference was
+tried first and picked `k`, `3`, `%` all over the place.
 
-The regions are fitted on a small grid (at most ~240 samples across) and the
-smoothed colour interpolated back up, since finding them at full resolution
-cost over half a second a frame and bought nothing after a blur that size. It
-runs at the same speed as line art, and faster at small cells.
+Three refinements came from looking at the output:
+
+- **A stroke vocabulary, not all of ASCII.** Hand-made art keeps to brackets,
+  slashes and rules plus a few letters that really are line shapes (`L J v n u
+  c r o`). Against the full set, `H`, `q` and `y` won on any short curve.
+- **Rules at three heights.** Consolas's own `-` is only half a cell wide, and
+  nothing sat between the top and the bottom of a cell, so a straight run at
+  any other height came out as `,,,,,` or `......`. `‾` (overline) and `─`
+  (full-width centre rule) fill that in.
+- **A straight run is drawn as a rule.** On a clearly horizontal or vertical
+  piece of line, a character must span about ¾ of it and must not be much
+  thicker than it — otherwise each cell found a dot or an `o` that sat closer
+  to *part* of the line. Curves and diagonals are left free, since no single
+  glyph spans a diagonal. These rules only choose between characters; whether
+  a cell is inked at all is decided by the plain shape cost, or every curve
+  broke into pieces wherever no candidate was perfect.
+
+`[` and `]` set the number of regions, 2 to 6. Two is the barest silhouette
+and suits a single subject; some pictures want one more — the city's dark
+buildings share a colour with the dark sky above them, so only a third region
+separates them. `I` gives light lines on dark instead of pencil on paper.
+
+**Speed.** The regions are fitted on a small grid (about 240 samples across)
+and the smoothed colour interpolated back up. Each region is the set of
+colours nearest one centre, which is convex, so wherever the four surrounding
+grid points agree on a region every sample between them is in it too — only
+samples near a boundary need working out. Distances are computed per cell,
+in a small window round the cells the line actually crosses. Neither change
+alters a single pixel (checked on 40 renders) and together they take a 1080p
+frame from 39 ms to 17 ms.
 
 ## How the character mode works
 

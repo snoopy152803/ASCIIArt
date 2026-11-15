@@ -56,7 +56,9 @@
 #define MODE_COUNT 6
 
 #define OUTLINE_LEVELS_DEFAULT 2   /* regions: 2 = subject and background */
-#define OUTLINE_INK 0x00e8e8e8
+#define OUTLINE_INK 0x00404040       /* pencil grey */
+#define OUTLINE_PAPER 0x00f8f8f4
+#define OUTLINE_DMAX 6                 /* chamfer distances clip here */
 
 /* Blur is not a mode: it is a filter on the source frame, so it composes
    with whichever mode is drawing. Strength is a fraction of the decoded
@@ -173,7 +175,13 @@ typedef struct {
     double av_offset;                   /* audio lead, seconds */
     float line_thresh;                  /* line art: ink this much edge */
     int outline_levels;                 /* outline: tone regions, 2..6 */
-    float *orgb;                        /* outline: smoothed colour, 3/sample */
+    unsigned char *oedge;               /* outline: the line itself */
+    unsigned char *oatlas;              /* outline glyphs at the display size */
+    int oatlas_cw, oatlas_ch;
+    unsigned char *obank_dist;          /* each glyph's own distance map */
+    int *obank_ink, *obank_ink_n;       /* each glyph's ink pixels */
+    int *obank_span;                    /* each glyph's ink width, height */
+    int obank_fw, obank_fh;
     unsigned char *olab;                /* outline: region of each sample */
     int *ocell;                         /* outline: glyph per cell, 0 = none */
     int *ostack;                        /* outline: flood-fill work list */
@@ -981,13 +989,10 @@ static void build_bank(void)
  * and averaging gives exact coverage at any size, and it is what lets a 2x4
  * cell still carry a usable tone.
  */
-static void build_atlas(int cw, int ch)
+/* Rasterise a list of characters at cw x ch, the way the display does. */
+static void render_glyph_set(const wchar_t *cps, int n, int cw, int ch,
+                             unsigned char *atlas)
 {
-    if (g.atlas && g.atlas_cw == cw && g.atlas_ch == ch) return;
-    free(g.atlas);
-    g.atlas = (unsigned char *)malloc((size_t)NGLYPH * cw * ch);
-    g.atlas_cw = cw;
-    g.atlas_ch = ch;
 
     /* Supersample enough that the glyph is drawn at a size GDI renders well. */
     int ss = 1;
@@ -1017,9 +1022,9 @@ static void build_atlas(int cw, int ch)
     HGDIOBJ oldfont = SelectObject(dc, font);
 
     unsigned char *big = (unsigned char *)malloc((size_t)sw * sh);
-    for (int gi = 0; gi < NGLYPH; gi++) {
-        raster_glyph(dc, bmp, bits, sw, sh, (wchar_t)(FIRST_CH + gi), big);
-        unsigned char *out = g.atlas + (size_t)gi * cw * ch;
+    for (int gi = 0; gi < n; gi++) {
+        raster_glyph(dc, bmp, bits, sw, sh, cps[gi], big);
+        unsigned char *out = atlas + (size_t)gi * cw * ch;
         if (ss == 1) {
             memcpy(out, big, (size_t)cw * ch);
             continue;
@@ -1042,6 +1047,18 @@ static void build_atlas(int cw, int ch)
     SelectObject(dc, oldbmp);
     DeleteObject(bmp);
     DeleteDC(dc);
+}
+
+static void build_atlas(int cw, int ch)
+{
+    if (g.atlas && g.atlas_cw == cw && g.atlas_ch == ch) return;
+    free(g.atlas);
+    g.atlas = (unsigned char *)malloc((size_t)NGLYPH * cw * ch);
+    g.atlas_cw = cw;
+    g.atlas_ch = ch;
+    wchar_t cps[NGLYPH];
+    for (int i = 0; i < NGLYPH; i++) cps[i] = (wchar_t)(FIRST_CH + i);
+    render_glyph_set(cps, NGLYPH, cw, ch, g.atlas);
 }
 
 /* Braille dots, drawn rather than rendered from a font: Consolas has no
@@ -1363,11 +1380,127 @@ typedef struct {
  *   2. split it into a few regions of similar colour (2 by default) with
  *      k-means - colour, not just brightness, or a red ball on a blue sky
  *      of the same brightness would have no outline at all;
- *   3. ink only the cells a region boundary passes through;
+ *   3. draw the region boundaries as a thin line and choose each cell's
+ *      character by its shape against that line;
  *   4. throw away short pieces, so what is left is a few long strokes.
  *
- * The glyph for each cell comes from the direction of the boundary there,
- * so the outline is drawn with - _ | / \ like a hand-made one. */
+ * Drawn in dark ink on paper, the way text-art line drawings are. */
+
+/* The characters an outline is drawn with. Hand-made text art keeps to a
+   small vocabulary of strokes - brackets for curves, slashes, rules at the
+   bottom, middle and top of the cell - plus a few letters that really are
+   line shapes. Matching against all of ASCII let H, q, k and friends win
+   on any short curve, because some part of them happened to fit. The two
+   non-ASCII ones are Consolas's overline, the mirror of '_' for a line
+   along the top of a cell, a cap, and a full-width centre rule - Consolas's
+   own '-' is only half a cell wide, so a straight run made of it has gaps,
+   and with nothing full-width between the top and the bottom of a cell a
+   rule at any other height fell apart into commas. */
+static const wchar_t OUTLINE_CHARS[] =
+    L"()/\\|_-'`,.^~<>=:;vonucrLJ!\x203E\x2229\x2500";
+#define N_OUTLINE_CH ((int)(sizeof OUTLINE_CHARS / sizeof OUTLINE_CHARS[0]) - 1)
+
+/* A small handicap on the fussier characters. A boundary traced from a
+   picture has one-sample jaggies, and on a straight run a wavy '~' or a
+   doubled '=' fits those slightly better than a plain rule - but a person
+   would draw the rule, so a straight line should stay straight. */
+#define OUTLINE_FUSSY L"~=:;^<>!vnu"
+#define OUTLINE_FUSSY_COST 0.35f
+
+/* Chessboard distance to the nearest set pixel, clipped at dmax. Two
+   passes, so it costs the same however sparse the line is. */
+static void chess_dt(const unsigned char *mask, unsigned char *d, int w, int h,
+                     int dmax)
+{
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int v = mask[(size_t)y * w + x] ? 0 : dmax;
+            if (x > 0) v = imin(v, d[(size_t)y * w + x - 1] + 1);
+            if (y > 0) {
+                const unsigned char *up = d + (size_t)(y - 1) * w;
+                v = imin(v, up[x] + 1);
+                if (x > 0) v = imin(v, up[x - 1] + 1);
+                if (x + 1 < w) v = imin(v, up[x + 1] + 1);
+            }
+            d[(size_t)y * w + x] = (unsigned char)v;
+        }
+    for (int y = h - 1; y >= 0; y--)
+        for (int x = w - 1; x >= 0; x--) {
+            int v = d[(size_t)y * w + x];
+            if (x + 1 < w) v = imin(v, d[(size_t)y * w + x + 1] + 1);
+            if (y + 1 < h) {
+                const unsigned char *dn = d + (size_t)(y + 1) * w;
+                v = imin(v, dn[x] + 1);
+                if (x > 0) v = imin(v, dn[x - 1] + 1);
+                if (x + 1 < w) v = imin(v, dn[x + 1] + 1);
+            }
+            d[(size_t)y * w + x] = (unsigned char)v;
+        }
+}
+
+/* The outline vocabulary at the matching resolution: which pixels each
+   glyph inks, and how far every pixel of its cell is from that ink. The
+   distance map is worked out on a padded box, so a line running just
+   inside the cell edge still measures its true distance to the stroke. */
+static void build_outline_bank(int fw, int fh)
+{
+    if (g.obank_dist && g.obank_fw == fw && g.obank_fh == fh) return;
+    int n = N_OUTLINE_CH, cell = fw * fh, D = OUTLINE_DMAX;
+    free(g.obank_dist); free(g.obank_ink); free(g.obank_ink_n); free(g.obank_span);
+    g.obank_span = (int *)malloc((size_t)n * 2 * sizeof(int));
+    g.obank_dist = (unsigned char *)malloc((size_t)n * cell);
+    g.obank_ink = (int *)malloc((size_t)n * cell * sizeof(int));
+    g.obank_ink_n = (int *)malloc((size_t)n * sizeof(int));
+    unsigned char *cov = (unsigned char *)malloc((size_t)n * cell);
+    int pw = fw + 2 * D, ph = fh + 2 * D;
+    unsigned char *pm = (unsigned char *)calloc((size_t)pw * ph, 1);
+    unsigned char *pd = (unsigned char *)malloc((size_t)pw * ph);
+    if (!g.obank_dist || !g.obank_ink || !g.obank_ink_n || !g.obank_span ||
+        !cov || !pm || !pd) {
+        free(cov); free(pm); free(pd);
+        free(g.obank_dist); g.obank_dist = NULL;
+        return;
+    }
+    render_glyph_set(OUTLINE_CHARS, n, fw, fh, cov);
+    for (int i = 0; i < n; i++) {
+        const unsigned char *c = cov + (size_t)i * cell;
+        int k = 0;
+        memset(pm, 0, (size_t)pw * ph);
+        for (int y = 0; y < fh; y++)
+            for (int x = 0; x < fw; x++)
+                if (c[y * fw + x] > 77) {             /* 30% coverage is ink */
+                    g.obank_ink[(size_t)i * cell + k++] = y * fw + x;
+                    pm[(size_t)(y + D) * pw + x + D] = 1;
+                }
+        g.obank_ink_n[i] = k;
+        int x0 = fw, x1 = -1, y0 = fh, y1 = -1;
+        for (int q = 0; q < k; q++) {
+            int li = g.obank_ink[(size_t)i * cell + q], x = li % fw, y = li / fw;
+            x0 = imin(x0, x); x1 = imax(x1, x); y0 = imin(y0, y); y1 = imax(y1, y);
+        }
+        g.obank_span[i * 2] = x1 - x0 + 1;
+        g.obank_span[i * 2 + 1] = y1 - y0 + 1;
+        chess_dt(pm, pd, pw, ph, D);
+        for (int y = 0; y < fh; y++)
+            for (int x = 0; x < fw; x++)
+                g.obank_dist[(size_t)i * cell + y * fw + x] =
+                    pd[(size_t)(y + D) * pw + x + D];
+    }
+    free(cov); free(pm); free(pd);
+    g.obank_fw = fw;
+    g.obank_fh = fh;
+}
+
+static void build_outline_atlas(int cw, int ch)
+{
+    if (g.oatlas && g.oatlas_cw == cw && g.oatlas_ch == ch) return;
+    free(g.oatlas);
+    g.oatlas = (unsigned char *)malloc((size_t)N_OUTLINE_CH * cw * ch);
+    if (!g.oatlas) return;
+    render_glyph_set(OUTLINE_CHARS, N_OUTLINE_CH, cw, ch, g.oatlas);
+    g.oatlas_cw = cw;
+    g.oatlas_ch = ch;
+}
 
 static void box_blur_f(float *a, float *tmp, int w, int h, int r)
 {
@@ -1396,9 +1529,9 @@ static void box_blur_f(float *a, float *tmp, int w, int h, int r)
 static int outline_alloc(int sub_n, int cells)
 {
     if (sub_n > g.oscratch_sub) {
-        free(g.olab); free(g.orgb);
+        free(g.olab); free(g.oedge);
         g.olab = (unsigned char *)malloc((size_t)sub_n);
-        g.orgb = (float *)malloc((size_t)sub_n * 3 * sizeof(float));
+        g.oedge = (unsigned char *)malloc((size_t)sub_n);
         g.oscratch_sub = sub_n;
     }
     if (cells > g.oscratch_cells) {
@@ -1407,12 +1540,13 @@ static int outline_alloc(int sub_n, int cells)
         g.ostack = (int *)malloc((size_t)cells * sizeof(int));
         g.oscratch_cells = cells;
     }
-    return g.olab && g.orgb && g.ocell && g.ostack;
+    return g.olab && g.oedge && g.ocell && g.ostack;
 }
 
 typedef struct {
-    int sub_w, sub_h, cols, rows, f, cw_, ch_, k;
+    int sub_w, sub_h, cols, rows, f, cw_, ch_, k, fw, fh;
     const float *crgb;
+    const unsigned char *clab;          /* region of each small-grid sample */
     float cen[6][3];
 } OutlineCtx;
 
@@ -1431,11 +1565,23 @@ static void outline_label_band(void *vctx, int yy0, int yy1)
             float fx = (x + 0.5f) / f - 0.5f;
             int x0 = clampi((int)floorf(fx), 0, cw_ - 1), x1 = imin(x0 + 1, cw_ - 1);
             float tx = clampf(fx - x0, 0.0f, 1.0f);
+            /* Each region is the set of colours nearest one centre, which is
+               convex - so if all four corners are in the same region, every
+               blend of them is too, and the label is known without working
+               it out. That is nearly every sample; only those near a
+               boundary need the full sum. */
+            unsigned char l00 = c->clab[(size_t)y0 * cw_ + x0];
+            if (l00 == c->clab[(size_t)y0 * cw_ + x1] &&
+                l00 == c->clab[(size_t)y1 * cw_ + x0] &&
+                l00 == c->clab[(size_t)y1 * cw_ + x1]) {
+                g.olab[(size_t)y * sub_w + x] = l00;
+                continue;
+            }
             const float *p00 = crgb + ((size_t)y0 * cw_ + x0) * 3;
             const float *p01 = crgb + ((size_t)y0 * cw_ + x1) * 3;
             const float *p10 = crgb + ((size_t)y1 * cw_ + x0) * 3;
             const float *p11 = crgb + ((size_t)y1 * cw_ + x1) * 3;
-            float *o = g.orgb + ((size_t)y * sub_w + x) * 3;
+            float o[3];
             for (int ch = 0; ch < 3; ch++) {
                 float top = p00[ch] + (p01[ch] - p00[ch]) * tx;
                 float bot = p10[ch] + (p11[ch] - p10[ch]) * tx;
@@ -1454,73 +1600,120 @@ static void outline_label_band(void *vctx, int yy0, int yy1)
     }
 }
 
-/* Pick a glyph for every cell a region boundary passes through. A step
-   between two samples belongs to the cell holding the left/upper one, so
-   each is counted once and bands never write the same cell. */
+/* The line itself: a sample is on it when its region differs from the one
+   to its right or below, which draws every boundary exactly once and one
+   sample thick - a pencil line, not a band. */
+static void outline_edge_band(void *vctx, int y0, int y1)
+{
+    const OutlineCtx *c = (const OutlineCtx *)vctx;
+    int w = c->sub_w, h = c->sub_h;
+    for (int y = y0; y < y1; y++)
+        for (int x = 0; x < w; x++) {
+            unsigned char here = g.olab[(size_t)y * w + x];
+            g.oedge[(size_t)y * w + x] =
+                (x + 1 < w && g.olab[(size_t)y * w + x + 1] != here) ||
+                (y + 1 < h && g.olab[(size_t)(y + 1) * w + x] != here);
+        }
+}
+
+/* Choose each cell's character by shape. Chamfer matching: the cost of a
+   glyph is how far its ink lies from the line, plus how far the line lies
+   from its ink. The first punishes stray strokes in proportion to how far
+   they stray, so a letter with an extra arm loses to a plain bracket; the
+   second punishes leaving part of the line undrawn, so a lone '.' cannot
+   stand in for a long rule. Both use distance maps, which is what lets a
+   line sitting off-centre in its cell still match '|' rather than nothing. */
 static void outline_cell_band(void *vctx, int row0, int row1)
 {
     const OutlineCtx *c = (const OutlineCtx *)vctx;
-    int sub_w = c->sub_w, sub_h = c->sub_h, cols = c->cols;
-    const float (*cen)[3] = c->cen;
-    static const int BIN_CH[4] = { L'-', L'\\', L'|', L'/' };
+    int sub_w = c->sub_w, cols = c->cols, fw = c->fw, fh = c->fh;
+    int cell = fw * fh;
+    int line[16 * 32];
+    /* Distances are only ever read inside a cell the line passes through,
+       so they are worked out per cell, over the cell plus a margin wide
+       enough that a line just outside it still counts - not over the whole
+       picture, which cost more than everything else here put together. */
+    enum { D = OUTLINE_DMAX, WW = 8 + 2 * OUTLINE_DMAX, WH = 16 + 2 * OUTLINE_DMAX };
+    unsigned char wm[WW * WH], wd[WW * WH];
+    int ww = fw + 2 * D, wh = fh + 2 * D;
     for (int cy = row0; cy < row1; cy++) {
         for (int cx = 0; cx < cols; cx++) {
-            float bins[4] = { 0, 0, 0, 0 };
-            float wy = 0, wsum = 0;
-            for (int sy = 0; sy < GH; sy++) {
-                int py = cy * GH + sy;
-                for (int sx = 0; sx < GW; sx++) {
-                    int px = cx * GW + sx;
-                    unsigned char here = g.olab[(size_t)py * sub_w + px];
-                    int right = px + 1 < sub_w && g.olab[(size_t)py * sub_w + px + 1] != here;
-                    int down = py + 1 < sub_h && g.olab[(size_t)(py + 1) * sub_w + px] != here;
-                    if (!right && !down) continue;
-                    /* Boundary direction: the gradient of the smoothed colour
-                       along the line joining the two regions' centres. Not
-                       brightness, which is flat across exactly the colour
-                       edges this mode exists to catch. */
-                    int other = right ? g.olab[(size_t)py * sub_w + px + 1]
-                                      : g.olab[(size_t)(py + 1) * sub_w + px];
-                    float d0 = cen[here][0] - cen[other][0];
-                    float d1 = cen[here][1] - cen[other][1];
-                    float d2 = cen[here][2] - cen[other][2];
-                    int xm = px > 0 ? px - 1 : px, xp = px + 1 < sub_w ? px + 1 : px;
-                    int ym = py > 0 ? py - 1 : py, yp = py + 1 < sub_h ? py + 1 : py;
-#define PROJ(X, Y) (g.orgb[((size_t)(Y) * sub_w + (X)) * 3] * d0 + \
-                    g.orgb[((size_t)(Y) * sub_w + (X)) * 3 + 1] * d1 + \
-                    g.orgb[((size_t)(Y) * sub_w + (X)) * 3 + 2] * d2)
-                    float gx = PROJ(xp, py) - PROJ(xm, py);
-                    float gy = PROJ(px, yp) - PROJ(px, ym);
-#undef PROJ
-                    /* the sample grid is GW x GH per 1:2 cell, so a sample
-                       step is twice as tall as it is wide on screen */
-                    gy *= (float)GW / GH * 2.0f;
-                    float m = sqrtf(gx * gx + gy * gy) + 1e-6f;
-                    float ang = atan2f(gx, -gy);
-                    if (ang < 0) ang += 3.14159265f;
-                    int b = (int)((ang + 0.39269908f) / 0.78539816f) & 3;
-                    bins[b] += m;
-                    wy += m * (sy + (down ? 1.0f : 0.5f));
-                    wsum += m;
+            size_t origin = (size_t)cy * fh * sub_w + (size_t)cx * fw;
+            int n = 0, lx0 = fw, lx1 = -1, ly0 = fh, ly1 = -1;
+            for (int y = 0; y < fh; y++)
+                for (int x = 0; x < fw; x++)
+                    if (g.oedge[origin + (size_t)y * sub_w + x]) {
+                        line[n++] = y * fw + x;
+                        lx0 = imin(lx0, x); lx1 = imax(lx1, x);
+                        ly0 = imin(ly0, y); ly1 = imax(ly1, y);
+                    }
+            int lw = lx1 - lx0 + 1, lh = ly1 - ly0 + 1;
+            int pick = 0;
+            if (n >= 3) {
+                int bx = cx * fw - D, by = cy * fh - D;
+                for (int y = 0; y < wh; y++) {
+                    int sy = by + y;
+                    for (int x = 0; x < ww; x++) {
+                        int sx = bx + x;
+                        wm[y * ww + x] = sy >= 0 && sy < c->sub_h && sx >= 0 && sx < sub_w &&
+                                         g.oedge[(size_t)sy * sub_w + sx];
+                    }
                 }
+                chess_dt(wm, wd, ww, wh, D);
+                /* The shape cost alone decides whether this cell is inked at
+                   all; the handicaps below only decide which character. Let
+                   them do both and a cell with no perfect candidate went
+                   blank, which broke every curve into pieces. */
+                float best = 1e9f, best_raw = 1e9f;
+                int bi = -1;
+                /* Samples are square, so this is the line's real shape. */
+                int horiz = lw >= 2 * lh, vert = lh >= 2 * lw;
+                for (int i = 0; i < N_OUTLINE_CH; i++) {
+                    int gn = g.obank_ink_n[i];
+                    if (gn == 0) continue;
+                    const int *ink = g.obank_ink + (size_t)i * cell;
+                    const unsigned char *gd = g.obank_dist + (size_t)i * cell;
+                    int a = 0, b = 0;
+                    for (int q = 0; q < gn; q++) {
+                        int li = ink[q];
+                        a += wd[(li / fw + D) * ww + li % fw + D];
+                    }
+                    for (int q = 0; q < n; q++) b += gd[line[q]];
+                    float raw = (float)a / gn + (float)b / n;
+                    float cost = raw;
+                    if (wcschr(OUTLINE_FUSSY, OUTLINE_CHARS[i]))
+                        cost += OUTLINE_FUSSY_COST * fw / 8.0f;
+                    /* On a clearly straight run, a person draws a rule: the
+                       character has to span about as much of the run as the
+                       run does, and must not be much thicker than the line.
+                       Otherwise a row of '.' or 'o' stands in for a straight
+                       line wherever it sits between the heights of '_' and
+                       '-', because some part of each sits closer to it.
+                       Curves and diagonals are left free - no single glyph
+                       spans a diagonal, and that is where ( ) / \ do the
+                       work. */
+                    int gw = g.obank_span[i * 2], gh = g.obank_span[i * 2 + 1];
+                    if ((horiz && (4 * gw < 3 * lw || gh > lh + 4)) ||
+                        (vert && (4 * gh < 3 * lh || gw > lw + 3)))
+                        cost += 100.0f;
+                    if (cost < best) { best = cost; bi = i; }
+                    if (raw < best_raw) best_raw = raw;
+                }
+                /* Scaled to the cell: the same tolerance as the prototype's
+                   3 samples at 8 x 16. */
+                if (bi >= 0 && best_raw < 3.0f * fw / 8.0f) pick = bi + 1;
             }
-            int cp = 0;
-            if (wsum > 0) {
-                int best = 0;
-                for (int b = 1; b < 4; b++) if (bins[b] > bins[best]) best = b;
-                cp = BIN_CH[best];
-                if (best == 0) cp = (wy / wsum / GH > 0.6f) ? L'_' : L'-';
-            }
-            g.ocell[cy * cols + cx] = cp;
+            g.ocell[cy * cols + cx] = pick;
         }
     }
-
 }
 
-static void build_outline(int cols, int rows, int sub_w, int sub_h)
+static void build_outline(int cols, int rows, int sub_w, int sub_h, int fw, int fh)
 {
     int n = sub_w * sub_h, cells = cols * rows;
     if (!outline_alloc(n, cells)) return;
+    build_outline_bank(fw, fh);
+    if (!g.obank_dist) return;
 
     /* The regions are heavily smoothed, so there is nothing to gain from
        finding them at full sample resolution - doing so cost over half a
@@ -1618,17 +1811,32 @@ static void build_outline(int cols, int rows, int sub_w, int sub_h)
 
     /* Back up to full sample resolution: interpolate the smoothed colour,
        then label every sample by its nearest centre. */
-    OutlineCtx oc = { sub_w, sub_h, cols, rows, f, cw_, ch_, k, crgb };
+    unsigned char *clab = (unsigned char *)malloc((size_t)cn);
+    if (!clab) { free(crgb); free(cone); free(ctmp); return; }
+    for (int i = 0; i < cn; i++) {
+        const float *o = crgb + (size_t)i * 3;
+        int bq = 0;
+        float bd = 1e9f;
+        for (int q = 0; q < k; q++) {
+            float d0 = o[0] - cen[q][0], d1 = o[1] - cen[q][1], d2 = o[2] - cen[q][2];
+            float d = d0 * d0 + d1 * d1 + d2 * d2;
+            if (d < bd) { bd = d; bq = q; }
+        }
+        clab[i] = (unsigned char)bq;
+    }
+    OutlineCtx oc = { sub_w, sub_h, cols, rows, f, cw_, ch_, k, fw, fh, crgb, clab };
     memcpy(oc.cen, cen, sizeof cen);
     parallel_rows(outline_label_band, &oc, 0, sub_h);
-    free(crgb); free(cone); free(ctmp);
+    free(crgb); free(cone); free(ctmp); free(clab);
 
-    /* 4. Cells a boundary crosses. */
+    /* 4. Draw the boundaries as a one-sample line and pick each cell's
+          character by shape against it. */
+    parallel_rows(outline_edge_band, &oc, 0, sub_h);
     parallel_rows(outline_cell_band, &oc, 0, rows);
 
     /* 5. Drop short pieces: a connected run of fewer than this many cells
           is a speck or a texture fragment, not part of an outline. */
-    int minlen = imax(4, (cols + rows) / 18);
+    int minlen = imax(4, (cols + rows) / 10);
     for (int i = 0; i < cells; i++) {
         if (g.ocell[i] <= 0) continue;
         /* flood-fill the piece, marking visited cells negative */
@@ -1685,13 +1893,12 @@ static void render_rows(const RowJob *j)
 
     if (g.mode == MODE_OUTLINE) {
         /* One ink, no shading: this is a drawing, not a picture. */
+        unsigned int ink = g.invert ? OUTLINE_PAPER : OUTLINE_INK;
         for (int y = j->y0; y < j->y1; y++)
             for (int x = 0; x < cols; x++) {
-                int cp = g.ocell[(size_t)y * cols + x];
-                int gi = cp - FIRST_CH;
-                if (cp <= 0 || gi < 0 || gi >= NGLYPH) continue;
-                blit_glyph(g.atlas, gi, ox + x * cw, oy + y * ch, cw, ch,
-                           OUTLINE_INK, stride);
+                int gi = g.ocell[(size_t)y * cols + x] - 1;
+                if (gi < 0 || gi >= N_OUTLINE_CH) continue;
+                blit_glyph(g.oatlas, gi, ox + x * cw, oy + y * ch, cw, ch, ink, stride);
             }
         return;
     }
@@ -1978,9 +2185,12 @@ static void original_band(void *vctx, int y0, int y1)
 static void clear_band(void *ctx, int y0, int y1)
 {
     (void)ctx;
+    /* Outline is a pen drawing, so it goes on paper. */
+    unsigned int bgcol = (g.mode == MODE_OUTLINE && !g.invert) ? OUTLINE_PAPER
+                                                               : 0x00101010;
     for (int y = y0; y < y1; y++) {
         unsigned int *row = g.pixels + (size_t)y * g.dib_w;
-        for (int x = 0; x < g.dib_w; x++) row[x] = 0x00101010;
+        for (int x = 0; x < g.dib_w; x++) row[x] = bgcol;
     }
 }
 
@@ -2043,9 +2253,13 @@ static void render(void)
 
     int shape = (g.mode == MODE_ASCII) && (ch >= SHAPE_MIN_CELL);
     int sub_w = cols, sub_h = rows;
-    if (shape || g.mode == MODE_LINES || g.mode == MODE_OUTLINE) {
-        sub_w = cols * GW;  sub_h = rows * GH;
-    }
+    /* Outline matches line shapes, which needs more than the 4 x 8 samples
+       a cell gets for tone: up to one per pixel, at most 8 x 16. */
+    /* 8 x 16 whenever the cell is big enough to show the difference: at
+       6 x 12 the matcher could no longer tell '_' from ','. */
+    int ofw = cw >= 6 ? 8 : 4, ofh = ofw * 2;
+    if (g.mode == MODE_OUTLINE) { sub_w = cols * ofw; sub_h = rows * ofh; }
+    else if (shape || g.mode == MODE_LINES) { sub_w = cols * GW;  sub_h = rows * GH; }
     else if (g.mode == MODE_BRAILLE)   { sub_w = cols * BRW; sub_h = rows * BRH; }
 
     size_t need_sub = (size_t)sub_w * sub_h;
@@ -2105,8 +2319,9 @@ static void render(void)
         parallel_rows(blur_band, &bc, 0, sub_h);
     }
     if (g.mode == MODE_OUTLINE) {
-        build_outline(cols, rows, sub_w, sub_h);
-        if (!g.ocell) return;
+        build_outline(cols, rows, sub_w, sub_h, ofw, ofh);
+        build_outline_atlas(cw, ch);
+        if (!g.ocell || !g.oatlas || !g.obank_dist) return;
     }
 
     parallel_rows(clear_band, NULL, 0, g.dib_h);

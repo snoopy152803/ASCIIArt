@@ -232,7 +232,7 @@ def test_video():
     # Pull a real frame through the ffmpeg pipe and render it, same as playback.
     with tempfile.TemporaryDirectory() as td:
         png = os.path.join(td, "f.png")
-        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "2",
+        subprocess.run([asciiview._tool("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "2",
                         "-i", clip, "-frames:v", "1", "-y", png], check=True)
         score = verify.run(png, "half", 100, 1000, "truecolor", OUT)
         check("decoded frame renders", score > 18, f"PSNR {score:.1f} dB")

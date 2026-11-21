@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import glob
 import shutil
 import subprocess
 import sys
@@ -177,8 +178,38 @@ def _run_frames(get, total, args, rows) -> int:
 
 # ------------------------------------------------------------------------- video
 
+def _ffmpeg_dirs():
+    """Where ffmpeg usually lives when it is not on PATH.
+
+    The same search the desktop app does: a winget install only works while
+    its Links folder stays on PATH, and installers that rewrite PATH can drop
+    it, at which point every file fails to open although ffmpeg is fine."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.environ.get("LOCALAPPDATA", "")
+    home = os.environ.get("USERPROFILE", "")
+    dirs = [here]
+    if local:
+        dirs.append(os.path.join(local, "Microsoft", "WinGet", "Links"))
+        dirs += sorted(glob.glob(os.path.join(local, "Microsoft", "WinGet", "Packages",
+                                              "*FFmpeg*", "ffmpeg*", "bin")))
+    dirs += [r"C:\ffmpeg\bin", r"C:\ProgramData\chocolatey\bin",
+             r"C:\Program Files\ffmpeg\bin", r"C:\msys64\ucrt64\bin",
+             r"C:\msys64\mingw64\bin"]
+    dirs += sorted(glob.glob(r"C:\ffmpeg\*\bin"))
+    if home:
+        dirs.append(os.path.join(home, "scoop", "shims"))
+    return dirs
+
+
 def _tool(name: str) -> str | None:
-    return shutil.which(name)
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _ffmpeg_dirs():
+        p = os.path.join(d, name + ".exe")
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def probe(path: str) -> dict:

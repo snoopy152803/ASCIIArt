@@ -364,6 +364,7 @@ static void die(const wchar_t *msg)
 static void auto_levels_buf(unsigned char *buf);
 static int pump_video(void);
 static int open_media(const wchar_t *path, double start_at);
+static const wchar_t *decode_failure_text(void);
 static void adopt_child(HANDLE proc);
 
 /* Run a function over a range of rows, split across cores. Declared early so
@@ -2456,7 +2457,7 @@ static void open_dialog(void)
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) {
         if (!open_media(name, 0))
-            MessageBoxW(g.hwnd, L"Could not decode that file.", L"asciiapp", MB_OK);
+            MessageBoxW(g.hwnd, decode_failure_text(), L"asciiapp", MB_OK | MB_ICONWARNING);
         InvalidateRect(g.hwnd, NULL, FALSE);
     }
 }
@@ -3291,6 +3292,125 @@ static void draw_overlays_offscreen(int want_help)
     DeleteDC(dc);
 }
 
+/* ------------------------------------------------------------- find ffmpeg
+ *
+ * Every decode runs ffmpeg by name, so it used to work only if ffmpeg was on
+ * PATH. PATH is fragile: installers rewrite it, a Start menu shortcut can
+ * start the app with a different one, and a winget install puts ffmpeg in a
+ * folder that has to be on PATH to be found. When that folder fell off,
+ * every file in the app failed with "could not decode" although ffmpeg was
+ * installed and fine. So the usual install locations are searched too, and
+ * the folder that has it is put at the front of this process's PATH, which
+ * every ffmpeg, ffprobe and ffplay started afterwards inherits. */
+static int g_have_ffmpeg;
+
+static int dir_has_ffmpeg(const wchar_t *dir)
+{
+    wchar_t p[MAX_PATH];
+    _snwprintf(p, MAX_PATH - 1, L"%s\\ffmpeg.exe", dir);
+    p[MAX_PATH - 1] = 0;
+    DWORD a = GetFileAttributesW(p);
+    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+    _snwprintf(p, MAX_PATH - 1, L"%s\\ffprobe.exe", dir);
+    a = GetFileAttributesW(p);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* pattern ends in a wildcard folder name; look for <match>\<tail> */
+static int find_in_glob(const wchar_t *base, const wchar_t *pat, const wchar_t *tail,
+                        wchar_t *out)
+{
+    wchar_t q[MAX_PATH];
+    _snwprintf(q, MAX_PATH - 1, L"%s\\%s", base, pat);
+    q[MAX_PATH - 1] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(q, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int ok = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
+            continue;
+        _snwprintf(out, MAX_PATH - 1, L"%s\\%s%s", base, fd.cFileName, tail);
+        out[MAX_PATH - 1] = 0;
+        if (dir_has_ffmpeg(out)) { ok = 1; break; }
+        /* winget nests one more level: Packages\Gyan.FFmpeg_...\ffmpeg-x.y\bin */
+        wchar_t inner[MAX_PATH];
+        _snwprintf(inner, MAX_PATH - 1, L"%s\\%s", base, fd.cFileName);
+        inner[MAX_PATH - 1] = 0;
+        if (tail[0] == 0 && find_in_glob(inner, L"ffmpeg*", L"\\bin", out)) { ok = 1; break; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+static void locate_ffmpeg(void)
+{
+    wchar_t found[MAX_PATH];
+    if (SearchPathW(NULL, L"ffmpeg.exe", NULL, MAX_PATH, found, NULL) &&
+        SearchPathW(NULL, L"ffprobe.exe", NULL, MAX_PATH, found, NULL)) {
+        g_have_ffmpeg = 1;
+        return;
+    }
+
+    wchar_t dir[MAX_PATH] = L"", env[MAX_PATH];
+    int ok = 0;
+
+    /* next to the app itself */
+    if (GetModuleFileNameW(NULL, dir, MAX_PATH)) {
+        wchar_t *slash = wcsrchr(dir, L'\\');
+        if (slash) *slash = 0;
+        ok = dir_has_ffmpeg(dir);
+    }
+    if (!ok && GetEnvironmentVariableW(L"LOCALAPPDATA", env, MAX_PATH)) {
+        _snwprintf(dir, MAX_PATH - 1, L"%s\\Microsoft\\WinGet\\Links", env);
+        ok = dir_has_ffmpeg(dir);
+        if (!ok) {
+            wchar_t pk[MAX_PATH];
+            _snwprintf(pk, MAX_PATH - 1, L"%s\\Microsoft\\WinGet\\Packages", env);
+            ok = find_in_glob(pk, L"*FFmpeg*", L"", dir);
+        }
+    }
+    static const wchar_t *fixed[] = {
+        L"C:\\ffmpeg\\bin", L"C:\\ProgramData\\chocolatey\\bin",
+        L"C:\\Program Files\\ffmpeg\\bin", L"C:\\msys64\\ucrt64\\bin",
+        L"C:\\msys64\\mingw64\\bin", NULL };
+    for (int i = 0; !ok && fixed[i]; i++) {
+        wcscpy(dir, fixed[i]);
+        ok = dir_has_ffmpeg(dir);
+    }
+    if (!ok) ok = find_in_glob(L"C:\\ffmpeg", L"*", L"\\bin", dir);
+    if (!ok && GetEnvironmentVariableW(L"USERPROFILE", env, MAX_PATH)) {
+        wchar_t sc[MAX_PATH];
+        _snwprintf(sc, MAX_PATH - 1, L"%s\\scoop\\shims", env);
+        if (dir_has_ffmpeg(sc)) { wcscpy(dir, sc); ok = 1; }
+    }
+    if (!ok) return;
+
+    /* Put it first on this process's PATH; children inherit it. */
+    DWORD n = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    wchar_t *path = (wchar_t *)malloc(((size_t)n + MAX_PATH + 2) * sizeof(wchar_t));
+    if (!path) return;
+    wcscpy(path, dir);
+    wcscat(path, L";");
+    GetEnvironmentVariableW(L"PATH", path + wcslen(path), n);
+    SetEnvironmentVariableW(L"PATH", path);
+    free(path);
+    g_have_ffmpeg = 1;
+}
+
+/* Why an open failed, in words that say what to do about it. */
+static const wchar_t *decode_failure_text(void)
+{
+    return g_have_ffmpeg
+        ? L"Could not decode that file.\n\n"
+          L"ffmpeg ran but could not read a picture from it - it may not be an "
+          L"image or video (an audio-only file has no picture), or it may be damaged."
+        : L"Could not decode that file, because ffmpeg was not found.\n\n"
+          L"The app uses ffmpeg to read every picture and video. Install it "
+          L"(for example:  winget install Gyan.FFmpeg ) or put ffmpeg.exe and "
+          L"ffprobe.exe next to asciiapp.exe.";
+}
+
 /* -------------------------------------------------------------------- main */
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
@@ -3299,6 +3419,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 
     enable_dpi_awareness();   /* before any window or DC exists */
     init_child_job();
+    locate_ffmpeg();
 
     SYSTEM_INFO si_cpu;
     GetSystemInfo(&si_cpu);
@@ -3542,8 +3663,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     }
     if (argc > 1) {
         if (!open_media(argv[1], 0))
-            MessageBoxW(g.hwnd, L"Could not decode that file.\n\n"
-                                L"ffmpeg and ffprobe must be on PATH.",
+            MessageBoxW(g.hwnd, decode_failure_text(),
                         L"asciiapp", MB_OK | MB_ICONWARNING);
     }
     apply_cli_view(cli_mag, cli_cx, cli_cy);
